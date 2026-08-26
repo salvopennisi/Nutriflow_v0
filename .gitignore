@@ -1,0 +1,21 @@
+# Python / Dipendenze
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Streamlit
+.streamlit/
+
+# Test e coperture
+.pytest_cache/
+htmlcov/
+
+# Editor e IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+compress.ps1
