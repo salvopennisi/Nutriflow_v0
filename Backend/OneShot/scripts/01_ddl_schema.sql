@@ -184,6 +184,7 @@ CREATE TABLE diet_meal_items (
 
 CREATE TABLE micronutrients_quantities (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    micronutrients_name VARCHAR(100) NOT NULL,
     minimum_rda_suggested_daily_amount DECIMAL(6,2) NOT NULL,
     maximum_rda_suggested_daily_amount DECIMAL(6,2) NOT NULL,
     unità_misura VARCHAR(10),

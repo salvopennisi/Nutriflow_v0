@@ -22,8 +22,9 @@ from Backend.services.diet_service import (
     delete_diet_plan,
     diet_name_exists,
     calculate_nutrients_proportional,
+    calculate_diet_micronutrients_overview,
 )
-from Backend.services.food_service import get_all_foods
+from Backend.services.food_service import get_foods_for_diet_editor
 
 # Configurazione del logger
 logging.basicConfig(
@@ -205,6 +206,177 @@ def _pdf_text(value) -> str:
     """Testo sicuro per i Paragraph ReportLab."""
     return html.escape(str(value if value not in (None, "") else "N/D"))
 
+
+def _micronutrient_overview_dataframe(result: dict) -> pd.DataFrame:
+    """Converte il risultato BE nel modello visuale dell'overview micronutrienti."""
+    rows = []
+
+    for item in (result or {}).get("rows", []):
+        unit = str(item.get("unit") or "").strip()
+        label = str(item.get("micronutrient") or "N/D")
+        if unit:
+            label = f"{label} ({unit})"
+
+        # Usa lo stato semantico calcolato dal backend EFSA quando disponibile.
+        # Il fallback mantiene compatibilita con versioni precedenti del service.
+        status = str(item.get("comparison_status") or "").strip().upper()
+        if not status:
+            current_value = float(item.get("current_daily_value") or 0)
+            minimum_value = item.get("minimum_rda")
+            maximum_value = item.get("maximum_rda")
+            reference_type = str(item.get("reference_type") or "").strip().upper()
+            maximum_type = str(item.get("maximum_type") or "").strip().upper()
+
+            if minimum_value is not None and current_value < float(minimum_value):
+                status = "LOW_AI" if reference_type in {"AI", "SAFE_ADEQUATE"} else "LOW_PRI"
+            elif maximum_value is not None and current_value > float(maximum_value):
+                status = (
+                    "HIGH_WARNING"
+                    if maximum_type in {"SAFE_LEVEL", "SAFE_ADEQUATE"}
+                    else "HIGH_UL"
+                )
+            else:
+                status = "OK"
+
+        rows.append({
+            "Micronutriente": label,
+            "Valore attuale": round(float(item.get("current_daily_value") or 0), 2),
+            "Min consigliato": (
+                round(float(item["minimum_rda"]), 2)
+                if item.get("minimum_rda") is not None else None
+            ),
+            "Max consigliato": (
+                round(float(item["maximum_rda"]), 2)
+                if item.get("maximum_rda") is not None else None
+            ),
+            "__status": status,
+            "__note": str(item.get("comparison_note") or ""),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def _render_micronutrient_overview_table(df: pd.DataFrame, key: str) -> None:
+    """Renderizza l'overview con colorazione dell'intera riga direttamente in AG Grid."""
+    if df.empty:
+        return
+
+    grid_df = df.copy()
+    gb = GridOptionsBuilder.from_dataframe(grid_df)
+
+    gb.configure_default_column(
+        editable=False,
+        sortable=True,
+        filter=False,
+        resizable=True,
+    )
+    gb.configure_column("Micronutriente", flex=2.0, minWidth=240, pinned="left")
+    gb.configure_column("Valore attuale", type="numericColumn", flex=1.0, minWidth=140)
+    gb.configure_column("Min consigliato", type="numericColumn", flex=1.0, minWidth=140)
+    gb.configure_column("Max consigliato", type="numericColumn", flex=1.0, minWidth=140)
+    gb.configure_column("__status", hide=True, suppressColumnsToolPanel=True)
+    gb.configure_column("__note", hide=True, suppressColumnsToolPanel=True)
+
+    # Semantica grafica:
+    # - arancione: apporto sotto PRI/AI -> attenzione sull'adeguatezza, non diagnosi;
+    # - rosso: superamento di un vero UL;
+    # - giallo: superamento di un safe level / livello prudenziale;
+    # - grigio: confronto non valido/non configurato;
+    # - verde tenue: riferimento rispettato.
+    row_style = JsCode(r"""
+    function(params) {
+        const status = String((params.data && params.data.__status) || 'OK').toUpperCase();
+
+        if (status === 'HIGH_UL') {
+            return {
+                backgroundColor: '#FDE2E2',
+                color: '#8B1E1E',
+                fontWeight: '600',
+                borderLeft: '5px solid #DC2626'
+            };
+        }
+
+        if (status === 'LOW_PRI' || status === 'LOW_AI') {
+            return {
+                backgroundColor: '#FFF0DF',
+                color: '#7C3E00',
+                fontWeight: '600',
+                borderLeft: '5px solid #F97316'
+            };
+        }
+
+        if (status === 'HIGH_WARNING') {
+            return {
+                backgroundColor: '#FFF7CC',
+                color: '#6B5200',
+                fontWeight: '600',
+                borderLeft: '5px solid #EAB308'
+            };
+        }
+
+        if (status === 'NOT_COMPARABLE' || status === 'NO_REFERENCE') {
+            return {
+                backgroundColor: '#F1F3F5',
+                color: '#667085',
+                borderLeft: '5px solid #98A2B3'
+            };
+        }
+
+        return {
+            backgroundColor: '#EAF7EE',
+            color: '#205C37',
+            borderLeft: '5px solid #22C55E'
+        };
+    }
+    """)
+
+    gb.configure_grid_options(
+        getRowStyle=row_style,
+        rowHeight=36,
+        headerHeight=40,
+        domLayout="normal",
+        suppressRowHoverHighlight=False,
+        tooltipShowDelay=250,
+    )
+
+    grid_options = gb.build()
+    height = min(520, 48 + max(1, len(grid_df)) * 36)
+
+    AgGrid(
+        grid_df,
+        gridOptions=grid_options,
+        allow_unsafe_jscode=True,
+        fit_columns_on_grid_load=False,
+        height=height,
+        theme="streamlit",
+        key=key,
+    )
+
+
+def _render_micronutrient_reference_messages(result: dict) -> None:
+    """Legenda e avvisi compatti comuni alle due overview."""
+    result_rows = list((result or {}).get("rows", []))
+    not_comparable = [r for r in result_rows if r.get("comparison_status") == "NOT_COMPARABLE"]
+    no_reference = [r for r in result_rows if r.get("comparison_status") == "NO_REFERENCE"]
+
+    st.caption(
+        "🟠 sotto PRI/AI = apporto sotto il riferimento · "
+        "🔴 sopra UL = superamento del limite tollerabile · "
+        "🟡 sopra safe level = attenzione prudenziale · "
+        "🩶 grigio = non confrontabile · "
+        "🟢 verde = riferimento rispettato."
+    )
+
+    if not_comparable:
+        names = ", ".join(str(r.get("micronutrient")) for r in not_comparable)
+        st.info(
+            "Confronto prudenzialmente disabilitato per basi nutrizionali non equivalenti: "
+            f"{names}. I valori attuali restano visibili, ma min/max non generano alert."
+        )
+
+    if no_reference:
+        names = ", ".join(str(r.get("micronutrient")) for r in no_reference)
+        st.warning(f"Riferimento tipologico non configurato per: {names}.")
 
 def _diet_pdf_filename(diet_name: str) -> str:
     safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", str(diet_name or "piano_alimentare")).strip("_.")
@@ -535,6 +707,7 @@ selected_patient_full_name = (
 
 def _clear_editor_state_if_deleted(diet_id):
     """Evita che l'editor mantenga in sessione un piano appena eliminato."""
+    st.session_state.pop(f"diet_micronutrient_overview_{diet_id}", None)
     if str(st.session_state.get("diet_loaded_plan_id")) != str(diet_id):
         return
 
@@ -631,7 +804,7 @@ with tab_list:
     else:
         for diet in patient_diets:
             with st.expander(f"📁 {diet['diet_name']} (ID: {diet['id']})"):
-                action_download_col, action_delete_col = st.columns(2)
+                action_download_col, action_micro_col, action_delete_col = st.columns(3)
 
                 with action_download_col:
                     try:
@@ -647,6 +820,24 @@ with tab_list:
                     except Exception as exc:
                         logger.error("Errore durante la generazione del PDF", exc_info=True)
                         st.error(f"Impossibile generare il PDF: {exc}")
+
+                with action_micro_col:
+                    micro_state_key = f"diet_micronutrient_overview_{diet['id']}"
+                    if st.button(
+                        "🧬 Micronutrienti",
+                        key=f"calculate_diet_micronutrients_{diet['id']}",
+                        help="Calcola ora l'apporto medio giornaliero dei micronutrienti.",
+                        use_container_width=True,
+                    ):
+                        try:
+                            st.session_state[micro_state_key] = calculate_diet_micronutrients_overview(
+                                tec_conf,
+                                diet.get("items", []),
+                                days_in_plan=7,
+                            )
+                        except Exception as exc:
+                            logger.error("Errore nel calcolo micronutrienti della dieta", exc_info=True)
+                            st.error(f"Impossibile calcolare i micronutrienti: {exc}")
 
                 with action_delete_col:
                     delete_clicked = st.button(
@@ -694,6 +885,30 @@ with tab_list:
                                 logger.error("Errore durante l'eliminazione del piano", exc_info=True)
                                 st.error(f"Errore durante l'eliminazione del piano: {exc}")
 
+                micro_result = st.session_state.get(f"diet_micronutrient_overview_{diet['id']}")
+                if micro_result is not None:
+                    st.markdown("#### 🧬 Overview micronutrienti")
+                    st.caption(
+                        "Valore attuale = apporto medio giornaliero della dieta "
+                        "(totale dei 7 giorni / 7), confrontato con i riferimenti giornalieri configurati."
+                    )
+                    micro_df = _micronutrient_overview_dataframe(micro_result)
+                    if micro_df.empty:
+                        st.warning("Nessun alimento valido disponibile per il calcolo.")
+                    else:
+                        _render_micronutrient_overview_table(
+                            micro_df,
+                            key=f"micro_overview_saved_{diet['id']}"
+                        )
+                        _render_micronutrient_reference_messages(micro_result)
+
+                    missing_rda = micro_result.get("missing_rda_names", [])
+                    if missing_rda:
+                        st.warning(
+                            f"Riferimento non configurato per {len(missing_rda)} micronutrienti: "
+                            "i relativi min/max sono mostrati come N/D."
+                        )
+
                 st.markdown(f"**Descrizione:** {diet.get('descrizione', 'N/D')}")
                 st.markdown(f"**Avvertenze:** {diet.get('warnings', 'N/D')}")
                 st.markdown("---")
@@ -721,7 +936,7 @@ with tab_list:
 # Drop-in replacement del blocco originale.
 # Richiede gli stessi import/oggetti gia presenti nel file originale:
 # st, pd, json, AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode,
-# tab_create, get_all_foods, tec_conf, GIORNI_MAP,
+# tab_create, get_foods_for_diet_editor, tec_conf, GIORNI_MAP,
 # current_patient_id.
 
 
@@ -733,7 +948,7 @@ def _cached_get_all_foods(conf_cache_key, _tec_conf):
     dall'hashing di Streamlit per tollerare configurazioni contenenti
     oggetti non hashabili.
     """
-    return get_all_foods(_tec_conf)
+    return get_foods_for_diet_editor(_tec_conf)
 
 
 def _empty_diet_slot(rows=2):
@@ -803,14 +1018,12 @@ def _slot_keys(day, meal):
 
 
 def _zero_totals():
+    # L'editor mantiene solo i macro. I micronutrienti vengono calcolati on-demand.
     return {
         "kcal": 0.0,
         "carbs": 0.0,
         "fats": 0.0,
         "prot": 0.0,
-        "ferro_mg": 0.0,
-        "potassio_mg": 0.0,
-        "vitamina_c_mg": 0.0,
     }
 
 
@@ -837,10 +1050,6 @@ def _process_slot(df, day, meal, food_dict, food_js_db, giorno_code):
         carbs = round(nutrition["carbs"] * ratio, 1)
         fats = round(nutrition["fats"] * ratio, 1)
         prot = round(nutrition["prot"] * ratio, 1)
-        ferro = nutrition["ferro"] * ratio
-        potassio = nutrition["potassio"] * ratio
-        vit_c = nutrition["vit_c"] * ratio
-
         processed_items.append({
             "giorno_settimana": giorno_code,
             "giorno_label": day,
@@ -852,18 +1061,12 @@ def _process_slot(df, day, meal, food_dict, food_js_db, giorno_code):
             "carbs": carbs,
             "fats": fats,
             "prot": prot,
-            "ferro_mg": ferro,
-            "potassio_mg": potassio,
-            "vitamina_c_mg": vit_c,
         })
 
         totals["kcal"] += kcal
         totals["carbs"] += carbs
         totals["fats"] += fats
         totals["prot"] += prot
-        totals["ferro_mg"] += ferro
-        totals["potassio_mg"] += potassio
-        totals["vitamina_c_mg"] += vit_c
 
     return processed_items, totals
 
@@ -911,6 +1114,7 @@ def _reset_diet_editor_state(clear_search=True):
         "diet_last_grid_sync_request",
         "diet_grid_rx_revision",
         "diet_last_consolidation_revision",
+        "diet_micronutrient_overview_editor",
     ):
         st.session_state.pop(key, None)
 
@@ -1150,6 +1354,7 @@ def _make_grid_capture_callback(keys, day, meal):
         changed = old_sig != new_sig
         if changed:
             st.session_state["diet_aggregations_dirty"] = True
+            st.session_state.pop("diet_micronutrient_overview_editor", None)
 
         st.session_state["diet_grid_rx_revision"] = int(
             st.session_state.get("diet_grid_rx_revision", 0) or 0
@@ -1203,14 +1408,14 @@ def _safe_float(value):
         return 0.0
 
 
-def _normalize_nutrient_key(key):
+def _normalize_nutrition_field_name(field_name):
     """Normalizza i nomi dei nutrienti provenienti da DB/API.
 
     Esempi equivalenti: ``Protein (g)``, ``protein-g``, ``protein_g``.
     """
     import re
 
-    normalized = str(key or "").strip().lower()
+    normalized = str(field_name or "").strip().lower()
     normalized = normalized.replace("%", "pct")
     normalized = re.sub(r"[^a-z0-9]+", "_", normalized)
     return normalized.strip("_")
@@ -1243,14 +1448,14 @@ def _first_numeric_value(food, aliases, prefixes=()):
     dei prefissi controllati (es. ``protein_*``) per campi come
     ``protein_per_100g`` o ``proteins_100g``.
     """
-    normalized_aliases = {_normalize_nutrient_key(alias) for alias in aliases}
-    normalized_prefixes = tuple(_normalize_nutrient_key(p) for p in prefixes)
+    normalized_aliases = {_normalize_nutrition_field_name(alias) for alias in aliases}
+    normalized_prefixes = tuple(_normalize_nutrition_field_name(p) for p in prefixes)
 
     containers = list(_iter_nutrition_containers(food) or [])
 
     # 1) Match esatto: e sempre la scelta preferita.
     for container in containers:
-        normalized = {_normalize_nutrient_key(k): v for k, v in container.items()}
+        normalized = {_normalize_nutrition_field_name(k): v for k, v in container.items()}
         for alias in normalized_aliases:
             if alias in normalized:
                 return _safe_float(normalized[alias])
@@ -1259,9 +1464,9 @@ def _first_numeric_value(food, aliases, prefixes=()):
     if normalized_prefixes:
         for container in containers:
             for key, value in container.items():
-                normalized_key = _normalize_nutrient_key(key)
+                normalized_field = _normalize_nutrition_field_name(key)
                 if any(
-                    normalized_key == prefix or normalized_key.startswith(prefix + "_")
+                    normalized_field == prefix or normalized_field.startswith(prefix + "_")
                     for prefix in normalized_prefixes
                 ):
                     numeric = _safe_float(value)
@@ -1298,16 +1503,6 @@ def _normalize_food_nutrition(food):
             ),
             prefixes=("prot", "prots", "protein", "proteins", "proteine"),
         ),
-        "ferro": _first_numeric_value(food, (
-            "ferro_mg", "iron_mg", "ferro", "iron",
-        )),
-        "potassio": _first_numeric_value(food, (
-            "potassio_mg", "potassium_mg", "potassio", "potassium",
-        )),
-        "vit_c": _first_numeric_value(food, (
-            "vitamina_c_mg", "vitamin_c_mg", "vit_c_mg",
-            "vitamina_c", "vitamin_c", "vit_c",
-        )),
     }
 
 
@@ -2167,6 +2362,7 @@ class RowOptionsRenderer {
                             st.session_state[keys["sig"]] = returned_sig
                             if returned_sig != previous_sig:
                                 st.session_state["diet_aggregations_dirty"] = True
+                                st.session_state.pop("diet_micronutrient_overview_editor", None)
                                 st.session_state["diet_grid_rx_revision"] = int(
                                     st.session_state.get("diet_grid_rx_revision", 0) or 0
                                 ) + 1
@@ -2357,7 +2553,7 @@ class RowOptionsRenderer {
         # Overview settimanale lasciata sotto le grid come nella versione
         # stabile precedente, evitando di appesantire il blocco superiore.
         st.markdown("---")
-        st.markdown("#### 📊 Overview Settimanale & Micronutrienti")
+        st.markdown("#### 📊 Overview Settimanale")
 
         if weekly_totals["kcal"] > 0:
             st.metric("Kcal Totali Settimana", f"{weekly_totals['kcal']:.1f}")
@@ -2367,15 +2563,60 @@ class RowOptionsRenderer {
             mc2.metric("Grassi", f"{weekly_totals['fats']:.1f}g")
             mc3.metric("Proteine", f"{weekly_totals['prot']:.1f}g")
 
-            cols_alert = st.columns(2)
-            with cols_alert[0]:
-                if 0 < weekly_totals["ferro_mg"] < 5:
-                    st.caption("⚠️ Rischio potenziale carenza di Ferro.")
-            with cols_alert[1]:
-                if 0 < weekly_totals["vitamina_c_mg"] < 40:
-                    st.caption("⚠️ Apporto di Vitamina C inferiore ai target.")
         else:
             st.info("Nessun alimento inserito o grammi a 0.")
+
+        st.markdown("#### 🧬 Overview micronutrienti")
+        st.caption(
+            "Il calcolo non viene eseguito automaticamente: parte solo su richiesta e usa "
+            "l'apporto medio giornaliero del piano (totale dei 7 giorni / 7)."
+        )
+
+        if st.button(
+            "🧬 Calcola overview micronutrienti",
+            key="calculate_editor_micronutrients",
+            use_container_width=True,
+        ):
+            _recalculate_all_slots(
+                day_options_list,
+                pasti_options,
+                food_dict,
+                food_js_db,
+                trigger="micronutrients_button",
+            )
+            micro_items = _collect_cached_items(day_options_list, pasti_options)
+            if not micro_items:
+                st.session_state.pop("diet_micronutrient_overview_editor", None)
+                st.error("Inserisci almeno un alimento con quantità maggiore di 0.")
+            else:
+                try:
+                    st.session_state["diet_micronutrient_overview_editor"] = (
+                        calculate_diet_micronutrients_overview(
+                            tec_conf,
+                            micro_items,
+                            days_in_plan=7,
+                        )
+                    )
+                except Exception as exc:
+                    logger.error("Errore nel calcolo micronutrienti dell'editor", exc_info=True)
+                    st.error(f"Impossibile calcolare i micronutrienti: {exc}")
+
+        editor_micro_result = st.session_state.get("diet_micronutrient_overview_editor")
+        if editor_micro_result is not None:
+            editor_micro_df = _micronutrient_overview_dataframe(editor_micro_result)
+            if not editor_micro_df.empty:
+                _render_micronutrient_overview_table(
+                    editor_micro_df,
+                    key="micro_overview_editor"
+                )
+                _render_micronutrient_reference_messages(editor_micro_result)
+
+            missing_rda = editor_micro_result.get("missing_rda_names", [])
+            if missing_rda:
+                st.warning(
+                    f"Riferimento non configurato per {len(missing_rda)} micronutrienti: "
+                    "i relativi min/max sono mostrati come N/D."
+                )
 
         st.markdown("---")
 

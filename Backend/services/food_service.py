@@ -132,6 +132,28 @@ def get_all_foods(conf) -> list:
     finally:
         disconnect(conn)
 
+def get_foods_for_diet_editor(conf) -> list:
+    """
+    Recupera il catalogo minimo necessario all'editor delle diete.
+
+    I micronutrienti non vengono caricati qui: vengono letti dal DB soltanto
+    quando l'utente richiede esplicitamente la relativa overview.
+    """
+    conn = connect(conf)
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, item_name, kcal, carbs_g, fats_g, prots_g
+                FROM foods
+                ORDER BY item_name;
+                """
+            )
+            return cur.fetchall()
+    finally:
+        disconnect(conn)
+
+
 def get_food_by_id(conf, food_id: str) -> dict:
     """
     Recupera un alimento tramite ID.

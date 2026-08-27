@@ -11,6 +11,7 @@ venv/
 # Test e coperture
 .pytest_cache/
 htmlcov/
+Backend/OneShot/
 
 # Editor e IDE
 .vscode/
