@@ -804,7 +804,7 @@ with tab_list:
     else:
         for diet in patient_diets:
             with st.expander(f"📁 {diet['diet_name']} (ID: {diet['id']})"):
-                action_download_col, action_micro_col, action_delete_col = st.columns(3)
+                action_download_col, action_shopping_col, action_micro_col, action_delete_col = st.columns(4)
 
                 with action_download_col:
                     try:
@@ -838,6 +838,15 @@ with tab_list:
                         except Exception as exc:
                             logger.error("Errore nel calcolo micronutrienti della dieta", exc_info=True)
                             st.error(f"Impossibile calcolare i micronutrienti: {exc}")
+                with action_shopping_col:
+                    if st.button(
+                        "🛒 Lista Spesa",
+                        key=f"toggle_shopping_{diet['id']}",
+                        help="Mostra/nascondi la lista della spesa aggregata a schermo.",
+                        use_container_width=True,
+                    ):
+                        state_key = f"view_shopping_{diet['id']}"
+                        st.session_state[state_key] = not st.session_state.get(state_key, False)
 
                 with action_delete_col:
                     delete_clicked = st.button(
@@ -884,7 +893,26 @@ with tab_list:
                             except Exception as exc:
                                 logger.error("Errore durante l'eliminazione del piano", exc_info=True)
                                 st.error(f"Errore durante l'eliminazione del piano: {exc}")
-
+                if st.session_state.get(f"view_shopping_{diet['id']}", False):
+                    st.markdown("#### 🛒 Lista della Spesa Settimanale")
+                    shopping_items = {}
+                    # Usiamo la stessa affidabile logica presente nel generatore PDF
+                    for item in diet.get("items", []):
+                        item_name = str(item.get("item_name") or item.get("food_name") or "N/D").strip()
+                        norm_name = item_name.casefold()
+                        if norm_name not in shopping_items:
+                            shopping_items[norm_name] = {"Alimento": item_name, "Quantità totale (g)": 0.0}
+                        shopping_items[norm_name]["Quantità totale (g)"] += _pdf_number(item.get("grams"))
+                    
+                    if shopping_items:
+                        df_shopping = pd.DataFrame(list(shopping_items.values()))
+                        df_shopping = df_shopping.sort_values(by="Alimento")
+                        # Arrotondamento per una lettura a schermo più pulita
+                        df_shopping["Quantità totale (g)"] = df_shopping["Quantità totale (g)"].round(1)
+                        st.dataframe(df_shopping, use_container_width=True, hide_index=True)
+                    else:
+                        st.info("Nessun alimento presente nel piano alimentare.")
+                    st.markdown("---")
                 micro_result = st.session_state.get(f"diet_micronutrient_overview_{diet['id']}")
                 if micro_result is not None:
                     st.markdown("#### 🧬 Overview micronutrienti")
