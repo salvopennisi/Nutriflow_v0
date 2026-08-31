@@ -2556,12 +2556,13 @@ class RowOptionsRenderer {
         st.markdown("#### 📊 Overview Settimanale")
 
         if weekly_totals["kcal"] > 0:
-            st.metric("Kcal Totali Settimana", f"{weekly_totals['kcal']:.1f}")
-
+            mt1, mt2 = st.columns(2)
+            mt1.metric("Kcal Totali Settimana", f"{weekly_totals['kcal']:.1f}")
+            mt2.metric("Kcal giornaliere ( media )", f"{weekly_totals['kcal']/7:.1f}")
             mc1, mc2, mc3 = st.columns(3)
-            mc1.metric("Carb", f"{weekly_totals['carbs']:.1f}g")
-            mc2.metric("Grassi", f"{weekly_totals['fats']:.1f}g")
-            mc3.metric("Proteine", f"{weekly_totals['prot']:.1f}g")
+            mc1.metric("Carb medi", f"{weekly_totals['carbs']/7:.1f}g")
+            mc2.metric("Grassi medi", f"{weekly_totals['fats']/7:.1f}g")
+            mc3.metric("Proteine medie", f"{weekly_totals['prot']/7:.1f}g")
 
         else:
             st.info("Nessun alimento inserito o grammi a 0.")

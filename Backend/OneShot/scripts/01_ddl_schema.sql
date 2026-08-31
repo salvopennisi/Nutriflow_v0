@@ -165,10 +165,10 @@ CREATE TABLE diet_plans (
 
 CREATE TABLE diet_meal_items (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    
+    diet_plan_id UUID REFERENCES diet_plans(id) ON DELETE SET NULL
     food_id UUID REFERENCES foods(id) ON DELETE SET NULL,
     food_name VARCHAR(255) NOT NULL,
-    
+    meal_type VARCHAR(15) NOT null,
     grams DECIMAL(6,2) NOT NULL,
     giorno_settimana INT,
     -- Cache calcolata (opzionale, ma utile per evitare JOIN continui)
@@ -178,7 +178,7 @@ CREATE TABLE diet_meal_items (
     fats_calculated DECIMAL(6,2),
     
     CHECK (
-        (food_id IS NOT NULL )
+        (food_id IS NOT NULL and diet_plan_id is not null )
     )
 );
 
