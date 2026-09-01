@@ -1,98 +1,204 @@
 import logging
-import math
+from datetime import date
+
 from psycopg2.extras import RealDictCursor
+
 from Common.functions import connect, disconnect
+
+
+ALLOWED_NUTRITION_CONTEXTS = {"INITIAL", "DIET_PLAN", "FREE_DIET", "STOP"}
+ALLOWED_WORKOUT_CONTEXTS = {"INITIAL", "WORKOUT_PLAN", "NO_WORKOUT", "STOP"}
+
+
+def _validate_period_context(cur, biometric_data: dict) -> None:
+    """
+    Valida, quando presenti, i riferimenti al periodo precedente alla misurazione.
+
+    La validazione resta retrocompatibile con i flussi legacy che inseriscono
+    record peso-only senza contesto (es. creazione assistito / ricalcolo TDEE).
+    """
+    nutrition_context = biometric_data.get("nutrition_context")
+    workout_context = biometric_data.get("workout_context")
+
+    # Flusso legacy: nessun contesto fornito.
+    if nutrition_context is None and workout_context is None:
+        return
+
+    patient_id = biometric_data.get("patient_id")
+    if not patient_id:
+        raise ValueError("patient_id obbligatorio.")
+
+    if nutrition_context not in ALLOWED_NUTRITION_CONTEXTS:
+        raise ValueError(
+            "nutrition_context non valido. Valori ammessi: "
+            + ", ".join(sorted(ALLOWED_NUTRITION_CONTEXTS))
+        )
+
+    if workout_context not in ALLOWED_WORKOUT_CONTEXTS:
+        raise ValueError(
+            "workout_context non valido. Valori ammessi: "
+            + ", ".join(sorted(ALLOWED_WORKOUT_CONTEXTS))
+        )
+
+    diet_plan_id = biometric_data.get("diet_plan_id")
+    workout_plan_id = biometric_data.get("workout_plan_id")
+
+    if nutrition_context == "DIET_PLAN":
+        if not diet_plan_id:
+            raise ValueError("diet_plan_id obbligatorio quando nutrition_context = DIET_PLAN.")
+        cur.execute(
+            "SELECT 1 FROM diet_plans WHERE id = %s AND patient_id = %s;",
+            (diet_plan_id, patient_id),
+        )
+        if cur.fetchone() is None:
+            raise ValueError("Il piano alimentare selezionato non appartiene all'assistito.")
+    elif diet_plan_id:
+        raise ValueError(
+            "diet_plan_id deve essere NULL per Prima misurazione, Dieta libera o Stop."
+        )
+
+    if workout_context == "WORKOUT_PLAN":
+        if not workout_plan_id:
+            raise ValueError("workout_plan_id obbligatorio quando workout_context = WORKOUT_PLAN.")
+        cur.execute(
+            "SELECT 1 FROM workout_plans WHERE id = %s AND patient_id = %s;",
+            (workout_plan_id, patient_id),
+        )
+        if cur.fetchone() is None:
+            raise ValueError("Il workout selezionato non appartiene all'assistito.")
+    elif workout_plan_id:
+        raise ValueError(
+            "workout_plan_id deve essere NULL per Prima misurazione, Nessun workout o Stop."
+        )
+
+    context_start_date = biometric_data.get("context_start_date")
+    insert_date = biometric_data.get("insert_date") or date.today()
+
+    if nutrition_context == "INITIAL" or workout_context == "INITIAL":
+        if nutrition_context != "INITIAL" or workout_context != "INITIAL":
+            raise ValueError(
+                "Per una baseline iniziale nutrition_context e workout_context devono entrambi essere INITIAL."
+            )
+        if context_start_date is not None:
+            raise ValueError("context_start_date deve essere NULL per la prima misurazione.")
+    else:
+        if context_start_date is None:
+            raise ValueError("context_start_date obbligatoria per una misurazione successiva alla baseline.")
+        if context_start_date >= insert_date:
+            raise ValueError("context_start_date deve precedere insert_date.")
+
 
 def add_biometric_record(conf, biometric_data: dict) -> str:
     """
-    Aggiunge una nuova misurazione biometrica per un paziente.
-    Ritorna l'UUID del nuovo record inserito.
+    Aggiunge una nuova misurazione biometrica per un assistito.
+
+    Se il payload contiene nutrition_context/workout_context, valida anche che
+    gli eventuali piani referenziati appartengano allo stesso assistito.
     """
     conn = connect(conf)
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Estraiamo dinamicamente le chiavi e i valori per evitare query chilometriche
+            _validate_period_context(cur, biometric_data)
+
             keys = list(biometric_data.keys())
             columns = ", ".join(keys)
-            placeholders = ", ".join([f"%({k})s" for k in keys])
-            
+            placeholders = ", ".join([f"%({key})s" for key in keys])
+
             query = f"""
-                INSERT INTO biometrics ({columns}) 
-                VALUES ({placeholders}) 
+                INSERT INTO biometrics ({columns})
+                VALUES ({placeholders})
                 RETURNING id;
             """
             cur.execute(query, biometric_data)
-            new_id = cur.fetchone()['id']
+            new_id = cur.fetchone()["id"]
             conn.commit()
-            logging.info(f"Misurazione biometrica inserita per il paziente {biometric_data.get('patient_id')}")
-            return new_id
-    except Exception as e:
+            logging.info(
+                "Misurazione biometrica inserita per il paziente %s",
+                biometric_data.get("patient_id"),
+            )
+            return str(new_id)
+    except Exception as exc:
         conn.rollback()
-        logging.error(f"Errore in add_biometric_record: {e}")
+        logging.error("Errore in add_biometric_record: %s", exc)
         raise
     finally:
         disconnect(conn)
+
 
 def get_biometrics_history(conf, patient_id: str) -> list:
-    """
-    Recupera l'intero storico delle misurazioni di un paziente.
-    Utile per disegnare i grafici di trend.
-    """
+    """Recupera lo storico biometrico con i nomi dei piani referenziati."""
     conn = connect(conf)
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            query = """
-                SELECT * FROM biometrics 
-                WHERE patient_id = %s 
-                ORDER BY insert_date DESC;
-            """
-            cur.execute(query, (patient_id,))
+            cur.execute(
+                """
+                SELECT
+                    b.*,
+                    dp.diet_name AS diet_plan_name,
+                    wp.workout_name AS workout_plan_name
+                FROM biometrics b
+                LEFT JOIN diet_plans dp
+                    ON b.diet_plan_id = dp.id
+                LEFT JOIN workout_plans wp
+                    ON b.workout_plan_id = wp.id
+                WHERE b.patient_id = %s
+                ORDER BY b.insert_date DESC, b.id DESC;
+                """,
+                (patient_id,),
+            )
             return cur.fetchall()
-    except Exception as e:
-        logging.error(f"Errore in get_biometrics_history: {e}")
+    except Exception as exc:
+        logging.error("Errore in get_biometrics_history: %s", exc)
         raise
     finally:
         disconnect(conn)
 
-def get_latest_biometrics(conf, patient_id: str) -> dict:
-    """
-    Recupera solo l'ultima misurazione registrata per un paziente.
-    Ritorna None se non ci sono misurazioni.
-    """
+
+def get_latest_biometrics(conf, patient_id: str) -> dict | None:
+    """Recupera l'ultima misurazione e il contesto dieta/workout associato."""
     conn = connect(conf)
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            query = """
-                SELECT * FROM biometrics 
-                WHERE patient_id = %s 
-                ORDER BY insert_date DESC 
+            cur.execute(
+                """
+                SELECT
+                    b.*,
+                    dp.diet_name AS diet_plan_name,
+                    wp.workout_name AS workout_plan_name
+                FROM biometrics b
+                LEFT JOIN diet_plans dp
+                    ON b.diet_plan_id = dp.id
+                LEFT JOIN workout_plans wp
+                    ON b.workout_plan_id = wp.id
+                WHERE b.patient_id = %s
+                ORDER BY b.insert_date DESC, b.id DESC
                 LIMIT 1;
-            """
-            cur.execute(query, (patient_id,))
+                """,
+                (patient_id,),
+            )
             return cur.fetchone()
-    except Exception as e:
-        logging.error(f"Errore in get_latest_biometrics: {e}")
+    except Exception as exc:
+        logging.error("Errore in get_latest_biometrics: %s", exc)
         raise
     finally:
         disconnect(conn)
+
 
 def delete_biometric_record(conf, record_id: str) -> bool:
-    """
-    Elimina una specifica misurazione (in caso di errore di inserimento).
-    """
+    """Elimina una specifica misurazione inserita per errore."""
     conn = connect(conf)
     try:
         with conn.cursor() as cur:
-            query = "DELETE FROM biometrics WHERE id = %s;"
-            cur.execute(query, (record_id,))
+            cur.execute("DELETE FROM biometrics WHERE id = %s;", (record_id,))
             conn.commit()
             return True
-    except Exception as e:
+    except Exception as exc:
         conn.rollback()
-        logging.error(f"Errore in delete_biometric_record: {e}")
+        logging.error("Errore in delete_biometric_record: %s", exc)
         raise
     finally:
         disconnect(conn)
+
 
 def calcola_bf_jackson_pollock_7(sesso: str, eta: int, pliche: dict) -> float:
     """
@@ -182,7 +288,7 @@ def calcola_proporzioni_auree_bodybuilding(misurazioni: dict, tipo_riferimento: 
             "Bacino/Fianchi": {"ideale": torace_ideale * 0.85, "reale": misurazioni.get('circ_fianchi_cm')},
             "Coscia": {"ideale": torace_ideale * 0.53, "reale": misurazioni.get('circ_coscia_cm')},
             "Braccio": {"ideale": braccio_ideale, "reale": misurazioni.get('circ_braccia_cm')},
-            "Avambraccio": {"ideale": braccio_ideale * 0.80, "reale": misurazioni.get('circ_avambraccio_cm')},
+            "Avambraccio": {"ideale": braccio_ideale * 0.80, "reale": misurazioni.get('circ_avambracci_cm') or misurazioni.get('circ_avambraccio_cm')},
             "Polpaccio": {"ideale": polso * 2.34, "reale": misurazioni.get('circ_polpacci_cm')},
             "Collo": {"ideale": torace_ideale * 0.37, "reale": misurazioni.get('circ_collo_cm')}
         }
