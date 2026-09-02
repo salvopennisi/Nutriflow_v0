@@ -33,7 +33,8 @@ Streamlit UI
     ├── pages/1_pazienti.py
     ├── pages/2_biometria.py
     ├── pages/3_piani_alimentari.py
-    └── pages/4_workout.py
+    ├── pages/4_workout.py
+    └── pages/5_catalogo_alimenti.py
     │
     ▼
 Backend/services/*.py
@@ -55,7 +56,7 @@ Non è presente un API server applicativo: `Backend/main.py` è attualmente vuot
 | Biometria | ✅ Implementato | Misure antropometriche, 7 pliche, BF%, proporzioni classiche/auree, storico |
 | Piani alimentari | ✅ Implementato | Editor 7×5, macro, import/clone/update, lista spesa, PDF, micronutrienti |
 | Workout | ✅ Implementato | CRUD piani, esercizi/blocchi, tecniche, registrazione performance e trend |
-| Catalogo alimenti | ⚙️ Service-only | CRUD alimenti e categorie disponibile nel backend, senza pagina UI dedicata |
+| Catalogo alimenti | ✅ Implementato | UI dedicata per lista, ricerca, inserimento, modifica, eliminazione e import massivo CSV/JSON |
 | Riferimenti micronutrienti | ⚙️ Service-only | CRUD tipologica disponibile nel backend |
 | Anamnesi strutturata | ⚙️ Parziale | Service per domande/risposte presente; UI attuale usa soprattutto campi testuali liberi |
 | Autenticazione/ruoli | 🚧 Non implementato | Esiste la tabella `users`, ma la UI usa un `user_id` placeholder |
@@ -326,8 +327,10 @@ Stati visualizzati in UI:
 
 Il catalogo alimenti supporta:
 
-- alimenti di sistema (`user_id IS NULL`);
-- alimenti specifici di un utente;
+- catalogo condiviso tra i nutrizionisti nell'MVP;
+- ricerca, inserimento, modifica ed eliminazione dalla UI `pages/5_catalogo_alimenti.py`;
+- import massivo da CSV o JSON con anteprima e validazione;
+- gestione dei duplicati per nome tramite strategia `skip` o `update`;
 - macronutrienti;
 - indice glicemico;
 - vitamine;
@@ -335,7 +338,7 @@ Il catalogo alimenti supporta:
 - omega-3 e omega-6;
 - peculiarità nutrizionali.
 
-> Al momento non esiste una pagina Streamlit dedicata alla manutenzione del catalogo: queste capability sono disponibili solo a livello backend/service.
+> La separazione dei cibi per `user_id` non fa parte dell'MVP. La colonna resta nel modello come predisposizione futura, ma il catalogo corrente non applica filtri o ownership per nutrizionista.
 
 ---
 
@@ -739,13 +742,17 @@ Criteri principali:
 
 **Come amministratore del catalogo, voglio creare, leggere, modificare ed eliminare categorie alimentari, così da classificare gli alimenti disponibili.**
 
-### US-FOOD-02 - CRUD alimenti `[BE]`
+### US-FOOD-02 - Gestione catalogo alimenti `[UI/BE]`
 
-**Come amministratore del catalogo, voglio gestire alimenti con macro, indice glicemico, vitamine, minerali e altri attributi nutrizionali, così da alimentare l'editor delle diete con dati strutturati.**
+**Come nutrizionista, voglio listare e aggiornare il database dei cibi con la possibilità di aggiungere ed eliminare alimenti, così da mantenere il catalogo utilizzato nei piani alimentari.**
 
-### US-FOOD-03 - Alimenti di sistema e personali `[BE]`
+### US-FOOD-03 - Import massivo alimenti `[UI/BE]`
 
-**Come nutrizionista, voglio poter distinguere alimenti globali e alimenti associati al mio utente, così da combinare un catalogo comune con personalizzazioni.**
+**Come nutrizionista, voglio importare massivamente i miei cibi da CSV o JSON, così da popolare o aggiornare rapidamente il catalogo senza inserimenti manuali ripetitivi.**
+
+### US-FOOD-04 - Catalogo personale per nutrizionista `[BACKLOG - post MVP]`
+
+**Come nutrizionista, voglio distinguere in futuro i cibi associati al mio utente, così da poter disporre di un catalogo personale separato o combinato con quello condiviso.**
 
 ### US-MICRO-01 - CRUD riferimenti micronutrienti `[BE]`
 
@@ -828,7 +835,8 @@ Nutriflow/
 │   ├── 1_pazienti.py
 │   ├── 2_biometria.py
 │   ├── 3_piani_alimentari.py
-│   └── 4_workout.py
+│   ├── 4_workout.py
+│   └── 5_catalogo_alimenti.py
 │
 ├── Backend/
 │   ├── __init__.py
@@ -1246,8 +1254,9 @@ Le priorità tecniche più immediate sono:
 4. rimuovere il `user_id` placeholder introducendo un'identità applicativa coerente;
 5. aggiornare devcontainer e script di bootstrap;
 6. aggiungere test per `diet_service`, micronutrienti e `workout_service`;
-7. esporre, se necessario, una UI dedicata per catalogo alimenti e riferimenti micronutrienti;
-8. collegare alla UI il questionario di anamnesi strutturato già supportato dal backend.
+7. estendere, se necessario, la UI del catalogo alla manutenzione delle categorie e dei riferimenti micronutrienti;
+8. introdurre post-MVP la separazione/ownership del catalogo alimenti per nutrizionista;
+9. collegare alla UI il questionario di anamnesi strutturato già supportato dal backend.
 
 ---
 

@@ -77,7 +77,7 @@ CREATE TABLE biometrics (
 );
 
 -- ==========================================
--- 3. DATABASE ALIMENTI (Con Categorie e User)
+-- 3. DATABASE ALIMENTI (Catalogo condiviso MVP; ownership utente futura)
 -- ==========================================
 CREATE TABLE food_categories (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -86,7 +86,7 @@ CREATE TABLE food_categories (
 
 CREATE TABLE foods (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID REFERENCES users(id) ON DELETE CASCADE, -- NULL per cibi di sistema, valorizzato per i tuoi
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE, -- Riservato a futura separazione per nutrizionista; non usato nell'MVP
     category_id UUID REFERENCES food_categories(id) ON DELETE SET NULL, -- Serve per escludere le categorie
     item_name VARCHAR(255) NOT NULL,
     
