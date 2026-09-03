@@ -11,7 +11,7 @@ venv/
 # Test e coperture
 .pytest_cache/
 htmlcov/
-Backend/OneShot/
+Backend/OneShot/scripts/
 
 # Editor e IDE
 .vscode/
@@ -20,4 +20,5 @@ Backend/OneShot/
 *.swo
 
 compress.ps1
+Documenti/
 Nutriflow_clean.zip
