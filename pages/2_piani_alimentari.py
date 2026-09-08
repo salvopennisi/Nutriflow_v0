@@ -74,7 +74,8 @@ def _debug_df_payload(data, max_rows=10):
     interesting = [
         c for c in [
             "__row_id", "__action_touch", "__sync_request",
-            "Alimento", "Grammi (g)", "Kcal", "Fats", "Carbs", "Prots"
+            "Alimento", "Grammi (g)", "Target settimanale (g)",
+            "Assegnati (g)", "Residui (g)", "Kcal", "Fats", "Carbs", "Prots"
         ] if c in df.columns
     ]
     sample_df = df[interesting].head(max_rows) if interesting else df.head(max_rows)
@@ -713,7 +714,12 @@ def _clear_editor_state_if_deleted(diet_id):
 
     for key in list(st.session_state.keys()):
         key_str = str(key)
-        if key_str.startswith("diet_slot_") or key_str.startswith("ag_diet_slot_"):
+        if (
+            key_str.startswith("diet_slot_")
+            or key_str.startswith("ag_diet_slot_")
+            or key_str.startswith("diet_weekly_budget")
+            or key_str.startswith("ag_diet_weekly_budget")
+        ):
             st.session_state.pop(key, None)
 
     for key in (
@@ -989,6 +995,431 @@ def _empty_diet_slot(rows=2):
     })
 
 
+WEEKLY_BUDGET_GRID_KEY = "diet_weekly_budget_grid"
+WEEKLY_BUDGET_SIG_KEY = "diet_weekly_budget_sig"
+WEEKLY_BUDGET_ITEMS_KEY = "diet_weekly_budget_items"
+WEEKLY_BUDGET_TOTALS_KEY = "diet_weekly_budget_totals"
+# Snapshot delle grammature effettivamente consolidate nei giorni.
+# Non viene aggiornata dai callback AG Grid: cambia solo durante import o pulsante Budget.
+WEEKLY_BUDGET_ALLOCATED_KEY = "diet_weekly_budget_allocated_grams_v3"
+WEEKLY_BUDGET_OCCURRENCES_KEY = "diet_weekly_budget_occurrences_v1"
+WEEKLY_BUDGET_DIRTY_KEY = "diet_weekly_budget_dirty"
+WEEKLY_BUDGET_GRAMS_COL = "Target settimanale (g)"
+
+
+def _empty_weekly_budget(rows=4):
+    """Draft generico degli alimenti previsti nell'intera settimana."""
+    return pd.DataFrame({
+        "option": [""] * rows,
+        "__action_touch": [0] * rows,
+        "__sync_request": [0] * rows,
+        "Alimento": [None] * rows,
+        WEEKLY_BUDGET_GRAMS_COL: [0.0] * rows,
+    })
+
+
+def _normalize_weekly_budget_df(data):
+    """Mantiene nel session_state solo i campi editabili del budget settimanale."""
+    df = pd.DataFrame(data).copy()
+
+    if "option" not in df.columns:
+        df["option"] = ""
+    if "__action_touch" not in df.columns:
+        df["__action_touch"] = 0
+    if "__sync_request" not in df.columns:
+        df["__sync_request"] = 0
+    if "Alimento" not in df.columns:
+        df["Alimento"] = None
+    if WEEKLY_BUDGET_GRAMS_COL not in df.columns:
+        df[WEEKLY_BUDGET_GRAMS_COL] = 0.0
+    if "__row_id" not in df.columns:
+        df["__row_id"] = [str(i) for i in range(len(df))]
+
+    df = df[[
+        "option", "__row_id", "__action_touch", "__sync_request",
+        "Alimento", WEEKLY_BUDGET_GRAMS_COL
+    ]]
+    df["__row_id"] = df["__row_id"].astype(str)
+    df[WEEKLY_BUDGET_GRAMS_COL] = pd.to_numeric(
+        df[WEEKLY_BUDGET_GRAMS_COL], errors="coerce"
+    ).fillna(0.0)
+    return df
+
+
+def _weekly_budget_signature(df):
+    df = _normalize_weekly_budget_df(df)
+    return tuple(
+        (
+            "" if pd.isna(food_name) else str(food_name).strip(),
+            round(float(grams or 0.0), 4),
+        )
+        for food_name, grams in df[["Alimento", WEEKLY_BUDGET_GRAMS_COL]].itertuples(
+            index=False, name=None
+        )
+    )
+
+
+def _weekly_budget_basic_valid_rows(df):
+    if df is None:
+        return 0
+    try:
+        frame = _normalize_weekly_budget_df(df)
+    except Exception:
+        return 0
+    count = 0
+    for food_name, grams in frame[["Alimento", WEEKLY_BUDGET_GRAMS_COL]].itertuples(
+        index=False, name=None
+    ):
+        name = "" if pd.isna(food_name) else str(food_name).strip()
+        if name and _safe_float(grams) > 0:
+            count += 1
+    return count
+
+
+def _process_weekly_budget(df, food_dict, food_js_db):
+    """Consolida il budget e calcola i macro totali della settimana."""
+    normalized = _normalize_weekly_budget_df(df)
+    by_food = {}
+
+    for food_name, grams in normalized[["Alimento", WEEKLY_BUDGET_GRAMS_COL]].itertuples(
+        index=False, name=None
+    ):
+        if pd.isna(food_name):
+            continue
+        name = str(food_name).strip()
+        grams_value = _safe_float(grams)
+        if not name or grams_value <= 0 or name not in food_dict or name not in food_js_db:
+            continue
+
+        entry = by_food.setdefault(name, {
+            "food_id": food_dict[name]["id"],
+            "food_name": name,
+            "grams": 0.0,
+            "kcal": 0.0,
+            "carbs": 0.0,
+            "fats": 0.0,
+            "prot": 0.0,
+        })
+        entry["grams"] += grams_value
+
+    totals = _zero_totals()
+    items = []
+    for name, entry in by_food.items():
+        nutrition = food_js_db[name]
+        ratio = entry["grams"] / 100.0
+        entry["kcal"] = round(nutrition["kcal"] * ratio, 1)
+        entry["carbs"] = round(nutrition["carbs"] * ratio, 1)
+        entry["fats"] = round(nutrition["fats"] * ratio, 1)
+        entry["prot"] = round(nutrition["prot"] * ratio, 1)
+        items.append(entry)
+        for key in totals:
+            totals[key] += entry[key]
+
+    return items, totals
+
+
+def _recalculate_weekly_budget(food_dict, food_js_db, trigger="unknown"):
+    """Aggiornamento atomico del budget: draft -> source of truth in sessione."""
+    raw_df = st.session_state.get(WEEKLY_BUDGET_GRID_KEY)
+    if raw_df is None:
+        raw_df = _empty_weekly_budget()
+
+    normalized = _normalize_weekly_budget_df(raw_df)
+    items, totals = _process_weekly_budget(normalized, food_dict, food_js_db)
+
+    st.session_state[WEEKLY_BUDGET_GRID_KEY] = normalized
+    st.session_state[WEEKLY_BUDGET_SIG_KEY] = _weekly_budget_signature(normalized)
+    st.session_state[WEEKLY_BUDGET_ITEMS_KEY] = items
+    st.session_state[WEEKLY_BUDGET_TOTALS_KEY] = totals
+    st.session_state[WEEKLY_BUDGET_DIRTY_KEY] = False
+    st.session_state.pop("diet_micronutrient_overview_editor", None)
+
+    _diag_log(
+        "recalculate_weekly_budget",
+        trigger=trigger,
+        valid_rows=len(items),
+        totals=totals,
+        draft=_debug_df_payload(normalized),
+    )
+    return items, totals
+
+
+def _food_name_key(value):
+    """Chiave stabile per confrontare lo stesso alimento tra DB, grid e sessione."""
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def _aggregate_allocated_grams(days, meals):
+    """Somma le grammature dagli item Python gia processati (compatibilita)."""
+    allocated = {}
+    for day in days:
+        for meal in meals:
+            for item in st.session_state.get(_slot_keys(day, meal)["items"], []):
+                name = str(item.get("food_name") or "").strip()
+                if not name:
+                    continue
+                allocated[name] = allocated.get(name, 0.0) + _safe_float(item.get("grams"))
+    return allocated
+
+
+def _aggregate_allocated_grams_from_drafts(days, meals):
+    """Somma DIRETTAMENTE le grammature presenti nei dataframe dei 35 slot.
+
+    Questa funzione non dipende da ``_process_slot`` e quindi continua a funzionare
+    anche quando un alimento di un piano storico non e piu presente nel catalogo,
+    e il suo nome non viene piu riconosciuto da ``food_dict``. E' la sorgente
+    corretta per il contatore Assegnati/Residui, che deve rappresentare cio che
+    l'utente vede effettivamente nelle grid giornaliere.
+    """
+    by_key = {}
+
+    for day in days:
+        for meal in meals:
+            raw_df = st.session_state.get(_slot_keys(day, meal)["grid"])
+            if raw_df is None:
+                continue
+
+            try:
+                slot_df = _normalize_slot_df(raw_df)
+            except Exception:
+                continue
+
+            for food_name, grams in slot_df[["Alimento", "Grammi (g)"]].itertuples(
+                index=False, name=None
+            ):
+                name = "" if pd.isna(food_name) else str(food_name).strip()
+                grams_value = _safe_float(grams)
+                if not name or grams_value <= 0:
+                    continue
+
+                key = _food_name_key(name)
+                if not key:
+                    continue
+
+                if key not in by_key:
+                    by_key[key] = {"label": name, "grams": 0.0}
+                by_key[key]["grams"] += grams_value
+
+    return {
+        entry["label"]: entry["grams"]
+        for entry in by_key.values()
+    }
+
+
+def _aggregate_allocated_occurrences_from_drafts(days, meals):
+    """Conta quante volte ogni alimento compare nei RAW della Distribuzione.
+
+    Ogni riga con alimento valorizzato e grammatura > 0 vale una presenza.
+    Il conteggio e indipendente dai macro e viene usato esclusivamente dal
+    riepilogo del Budget alimentare.
+    """
+    by_key = {}
+
+    for day in days:
+        for meal in meals:
+            raw_df = st.session_state.get(_slot_keys(day, meal)["grid"])
+            if raw_df is None:
+                continue
+
+            try:
+                slot_df = _normalize_slot_df(raw_df)
+            except Exception:
+                continue
+
+            for food_name, grams in slot_df[["Alimento", "Grammi (g)"]].itertuples(
+                index=False, name=None
+            ):
+                name = "" if pd.isna(food_name) else str(food_name).strip()
+                grams_value = _safe_float(grams)
+                if not name or grams_value <= 0:
+                    continue
+
+                key = _food_name_key(name)
+                if not key:
+                    continue
+
+                if key not in by_key:
+                    by_key[key] = {"label": name, "count": 0}
+                by_key[key]["count"] += 1
+
+    return {
+        entry["label"]: int(entry["count"])
+        for entry in by_key.values()
+    }
+
+
+def _aggregate_budget_targets_from_draft(data=None):
+    """Aggrega i target del budget leggendo direttamente il draft della grid.
+
+    E' volutamente indipendente dai macro consolidati: serve per i controlli di
+    coerenza e deve riflettere esattamente cio che l'utente ha scritto.
+    """
+    raw_df = data if data is not None else st.session_state.get(WEEKLY_BUDGET_GRID_KEY)
+    if raw_df is None:
+        raw_df = _empty_weekly_budget()
+
+    df = _normalize_weekly_budget_df(raw_df)
+    by_key = {}
+    for food_name, grams in df[["Alimento", WEEKLY_BUDGET_GRAMS_COL]].itertuples(
+        index=False, name=None
+    ):
+        name = "" if pd.isna(food_name) else str(food_name).strip()
+        grams_value = _safe_float(grams)
+        if not name or grams_value <= 0:
+            continue
+        key = _food_name_key(name)
+        if not key:
+            continue
+        if key not in by_key:
+            by_key[key] = {"label": name, "grams": 0.0}
+        by_key[key]["grams"] += grams_value
+
+    return {entry["label"]: entry["grams"] for entry in by_key.values()}
+
+
+def _budget_distribution_consistency(days, meals, budget_df=None, tolerance=0.05):
+    """Confronta i RAW correnti di budget e distribuzione senza usare cache intermedie.
+
+    Restituisce una tabella per alimento e un booleano di coerenza. Il salvataggio
+    e consentito solo quando ogni alimento ha Budget == Assegnato (entro tolleranza)
+    e non esistono alimenti assegnati fuori budget.
+    """
+    targets = _aggregate_budget_targets_from_draft(budget_df)
+    allocated = _aggregate_allocated_grams_from_drafts(days, meals)
+    occurrences = _aggregate_allocated_occurrences_from_drafts(days, meals)
+    occurrences_by_key = {
+        _food_name_key(name): int(count)
+        for name, count in occurrences.items()
+        if _food_name_key(name)
+    }
+
+    targets_by_key = {}
+    labels = {}
+    for name, grams in targets.items():
+        key = _food_name_key(name)
+        targets_by_key[key] = targets_by_key.get(key, 0.0) + _safe_float(grams)
+        labels.setdefault(key, name)
+
+    allocated_by_key = {}
+    for name, grams in allocated.items():
+        key = _food_name_key(name)
+        allocated_by_key[key] = allocated_by_key.get(key, 0.0) + _safe_float(grams)
+        labels.setdefault(key, name)
+
+    rows = []
+    coherent = True
+    for key in sorted(set(targets_by_key) | set(allocated_by_key), key=lambda k: labels.get(k, k).casefold()):
+        target = _safe_float(targets_by_key.get(key, 0.0))
+        assigned = _safe_float(allocated_by_key.get(key, 0.0))
+        delta = target - assigned
+
+        if key not in targets_by_key and assigned > tolerance:
+            status = "FUORI BUDGET"
+            coherent = False
+        elif abs(delta) <= tolerance:
+            status = "COERENTE"
+            delta = 0.0
+        elif assigned < target:
+            status = "ASSEGNATO < BUDGET"
+            coherent = False
+        else:
+            status = "ASSEGNATO > BUDGET"
+            coherent = False
+
+        rows.append({
+            "N. volte": int(occurrences_by_key.get(key, 0)),
+            "Alimento": labels.get(key, key),
+            "Budget (g)": round(target, 1),
+            "Assegnati (g)": round(assigned, 1),
+            "Differenza (g)": round(delta, 1),
+            "Stato": status,
+        })
+
+    if not rows:
+        coherent = False
+
+    return pd.DataFrame(rows), coherent
+
+
+def _weekly_budget_status_dataframe(days, meals):
+    """Vista del budget basata SOLO sull'ultimo confronto esplicito del Budget.
+
+    I draft giornalieri non aggiornano automaticamente ``Assegnati``: lo snapshot
+    cambia soltanto all'import iniziale o premendo il pulsante dedicato al Budget.
+    La Distribuzione settimanale ha quindi un ciclo di aggiornamento indipendente.
+    """
+    allocated = st.session_state.get(WEEKLY_BUDGET_ALLOCATED_KEY, {}) or {}
+    occurrences = st.session_state.get(WEEKLY_BUDGET_OCCURRENCES_KEY, {}) or {}
+    occurrences_by_key = {
+        _food_name_key(name): int(count or 0)
+        for name, count in dict(occurrences).items()
+        if _food_name_key(name)
+    }
+    allocated = {
+        str(name).strip(): _safe_float(grams)
+        for name, grams in dict(allocated).items()
+        if str(name).strip()
+    }
+
+    allocated_by_key = {}
+    allocated_label_by_key = {}
+    for allocated_name, grams in allocated.items():
+        key = _food_name_key(allocated_name)
+        if not key:
+            continue
+        allocated_by_key[key] = allocated_by_key.get(key, 0.0) + _safe_float(grams)
+        allocated_label_by_key.setdefault(key, allocated_name)
+
+    rows = []
+    budget_keys = set()
+
+    for item in st.session_state.get(WEEKLY_BUDGET_ITEMS_KEY, []):
+        name = str(item.get("food_name") or "").strip()
+        if not name:
+            continue
+        key = _food_name_key(name)
+        budget_keys.add(key)
+        target = _safe_float(item.get("grams"))
+        assigned = _safe_float(allocated_by_key.get(key, 0.0))
+        residual = target - assigned
+        if abs(residual) <= 0.05:
+            residual = 0.0
+            status = "COERENTE"
+        elif assigned < target:
+            status = "ASSEGNATO < BUDGET"
+        else:
+            status = "ASSEGNATO > BUDGET"
+        rows.append({
+            "N. volte": int(occurrences_by_key.get(key, 0)),
+            "Alimento": name,
+            WEEKLY_BUDGET_GRAMS_COL: round(target, 1),
+            "Assegnati (g)": round(assigned, 1),
+            "Residui (g)": round(residual, 1),
+            "Stato": status,
+        })
+
+    outside_budget = {
+        allocated_label_by_key[key]: grams
+        for key, grams in allocated_by_key.items()
+        if key not in budget_keys and grams > 0
+    }
+    return pd.DataFrame(rows), outside_budget
+
+
+def _weekly_budget_allowed_food_db(food_js_db):
+    """Catalogo proposto nelle grid giornaliere: solo alimenti consolidati nel budget."""
+    allowed_names = {
+        str(item.get("food_name") or "").strip()
+        for item in st.session_state.get(WEEKLY_BUDGET_ITEMS_KEY, [])
+        if str(item.get("food_name") or "").strip()
+    }
+    return {
+        name: food_js_db[name]
+        for name in allowed_names
+        if name in food_js_db
+    }
+
+
 def _normalize_slot_df(data):
     """Mantiene nello stato solo i dati realmente editabili.
 
@@ -1014,7 +1445,7 @@ def _normalize_slot_df(data):
 
     # Colonne tecniche:
     # - __action_touch forza un cellValueChanged dopo add/remove;
-    # - __sync_request trasporta il comando Ctrl/Cmd+Enter dalla grid a Python.
+    # - __sync_request resta per compatibilita tecnica con versioni precedenti.
     df = df[[
         "option", "__row_id", "__action_touch", "__sync_request",
         "Alimento", "Grammi (g)"
@@ -1129,7 +1560,12 @@ def _reset_diet_editor_state(clear_search=True):
     """Azzera esclusivamente lo stato dell'editor dieta, senza toccare il resto della pagina."""
     for key in list(st.session_state.keys()):
         key_str = str(key)
-        if key_str.startswith("diet_slot_") or key_str.startswith("ag_diet_slot_"):
+        if (
+            key_str.startswith("diet_slot_")
+            or key_str.startswith("ag_diet_slot_")
+            or key_str.startswith("diet_weekly_budget")
+            or key_str.startswith("ag_diet_weekly_budget")
+        ):
             del st.session_state[key]
 
     for key in (
@@ -1143,6 +1579,12 @@ def _reset_diet_editor_state(clear_search=True):
         "diet_grid_rx_revision",
         "diet_last_consolidation_revision",
         "diet_micronutrient_overview_editor",
+        "diet_budget_flash_message",
+        "diet_distribution_flash_message",
+        "diet_budget_last_check_rows",
+        "diet_budget_last_check_coherent",
+        "diet_budget_comparison_stale",
+        "diet_weekly_budget_import_needs_recalc",
     ):
         st.session_state.pop(key, None)
 
@@ -1173,6 +1615,43 @@ def _load_diet_into_editor(diet):
         if not day or not meal:
             continue
         items_by_slot.setdefault((day, meal), []).append(item)
+
+    # Il budget generico viene ricostruito aggregando le grammature del piano salvato.
+    # Non esiste ancora una persistenza DB separata del budget: per i piani importati
+    # il target iniziale coincide quindi con la somma delle allocazioni salvate.
+    budget_by_food = {}
+    budget_occurrences_by_food = {}
+    for item in diet.get("items", []):
+        food_name = str(item.get("food_name") or "").strip()
+        grams = _safe_float(item.get("grams"))
+        if not food_name:
+            continue
+        budget_by_food[food_name] = budget_by_food.get(food_name, 0.0) + grams
+        if grams > 0:
+            budget_occurrences_by_food[food_name] = budget_occurrences_by_food.get(food_name, 0) + 1
+
+    budget_rows = max(4, len(budget_by_food))
+    budget_df = _empty_weekly_budget(rows=budget_rows)
+    budget_df["__row_id"] = [
+        f"budget_import_{idx}"
+        for idx in range(budget_rows)
+    ]
+    for idx, (food_name, grams) in enumerate(budget_by_food.items()):
+        budget_df.at[idx, "Alimento"] = food_name
+        budget_df.at[idx, WEEKLY_BUDGET_GRAMS_COL] = grams
+
+    budget_df = _normalize_weekly_budget_df(budget_df)
+    st.session_state[WEEKLY_BUDGET_GRID_KEY] = budget_df
+    st.session_state[WEEKLY_BUDGET_SIG_KEY] = _weekly_budget_signature(budget_df)
+    st.session_state[WEEKLY_BUDGET_ITEMS_KEY] = []
+    st.session_state[WEEKLY_BUDGET_TOTALS_KEY] = _zero_totals()
+    # All'apertura di un piano esistente le allocazioni salvate sono gia dati
+    # consolidati: inizializziamo subito lo snapshot, senza attendere un rerun.
+    st.session_state[WEEKLY_BUDGET_ALLOCATED_KEY] = dict(budget_by_food)
+    st.session_state[WEEKLY_BUDGET_OCCURRENCES_KEY] = dict(budget_occurrences_by_food)
+    st.session_state["diet_budget_comparison_stale"] = False
+    st.session_state[WEEKLY_BUDGET_DIRTY_KEY] = True
+    st.session_state["diet_weekly_budget_import_needs_recalc"] = True
 
     meals = ["Colazione", "Spuntino", "Pranzo", "Merenda", "Cena"]
     revision = int(st.session_state.get("diet_editor_revision", 0) or 0)
@@ -1263,11 +1742,23 @@ def _recalculate_all_slots(days, meals, food_dict, food_js_db, trigger="unknown"
         st.session_state.get("diet_last_consolidation_revision", 0) or 0
     ) + 1
 
+    # Commit atomico dello snapshot delle grammature assegnate. I callback delle
+    # singole grid modificano solo i draft; questo snapshot cambia esclusivamente
+    # quando viene eseguito un consolidamento esplicito/import.
+    # IMPORTANTE: Assegnati/Residui devono riflettere le grammature realmente
+    # presenti nelle grid, non soltanto gli item riconosciuti dal catalogo.
+    # Un piano storico puo contenere alimenti rinominati/rimossi dal catalogo:
+    # in quel caso _process_slot li esclude dai macro, ma NON devono sparire dal
+    # conteggio delle grammature assegnate.
+    allocated_snapshot = _aggregate_allocated_grams_from_drafts(days, meals)
+    st.session_state[WEEKLY_BUDGET_ALLOCATED_KEY] = dict(allocated_snapshot)
+
     _diag_log(
         "recalculate_all_slots_end",
         trigger=trigger,
         total_basic_rows=total_basic_rows,
         total_processed_items=total_processed,
+        allocated_snapshot=allocated_snapshot,
         slot_summaries=slot_summaries,
         consolidation_revision=st.session_state.get("diet_last_consolidation_revision", 0),
     )
@@ -1333,6 +1824,57 @@ def _extract_aggrid_dataframe(grid_response, debug_context=None):
         return None
 
 
+def _extract_weekly_budget_dataframe(grid_response):
+    if grid_response is None:
+        return None
+    if isinstance(grid_response, dict):
+        data = grid_response.get("data")
+    else:
+        data = getattr(grid_response, "data", None)
+    if data is None:
+        return None
+    try:
+        return _normalize_weekly_budget_df(data)
+    except Exception as exc:
+        logger.warning("Impossibile normalizzare la grid budget settimanale: %s", exc)
+        return None
+
+
+def _make_weekly_budget_capture_callback():
+    """Cattura solo il draft. I calcoli ufficiali partono dal pulsante Budget."""
+    def _capture(grid_response):
+        edited_df = _extract_weekly_budget_dataframe(grid_response)
+        if edited_df is None:
+            return
+
+        old_df = st.session_state.get(WEEKLY_BUDGET_GRID_KEY)
+        old_sig = _weekly_budget_signature(old_df) if old_df is not None else None
+        new_sig = _weekly_budget_signature(edited_df)
+
+        st.session_state[WEEKLY_BUDGET_GRID_KEY] = edited_df
+        st.session_state[WEEKLY_BUDGET_SIG_KEY] = new_sig
+        if old_sig != new_sig:
+            # Il budget ha un proprio ciclo di consolidamento indipendente dalla
+            # distribuzione settimanale. Una modifica qui NON sporca i macro dei giorni.
+            st.session_state[WEEKLY_BUDGET_DIRTY_KEY] = True
+            st.session_state["diet_budget_comparison_stale"] = True
+
+        st.session_state["diet_grid_rx_revision"] = int(
+            st.session_state.get("diet_grid_rx_revision", 0) or 0
+        ) + 1
+
+    return _capture
+
+
+def _rerun_after_numeric_sync():
+    """Rinfresca la UI dopo il commit numerico, preferendo il solo fragment."""
+    try:
+        st.rerun(scope="fragment")
+    except Exception:
+        # Fallback per versioni senza scope o per esecuzioni full-app del fragment.
+        st.rerun()
+
+
 def _make_grid_capture_callback(keys, day, meal):
     """Salva il draft RAW appena st-aggrid notifica un cambio cella.
 
@@ -1382,6 +1924,7 @@ def _make_grid_capture_callback(keys, day, meal):
         changed = old_sig != new_sig
         if changed:
             st.session_state["diet_aggregations_dirty"] = True
+            st.session_state["diet_budget_comparison_stale"] = True
             st.session_state.pop("diet_micronutrient_overview_editor", None)
 
         st.session_state["diet_grid_rx_revision"] = int(
@@ -1771,15 +2314,9 @@ class FoodAutocompleteEditor {
                     this.eInput.value = this.filteredFoods[this.highlightedIndex];
                 }
                 this.closeMenu();
+                // Ctrl/Cmd+Enter chiude solo l'editing della cella.
+                // I consolidamenti sono avviati esclusivamente dai pulsanti dedicati.
                 params.stopEditing();
-
-                // Il custom editor intercetta Enter e quindi lo shortcut non
-                // arriverebbe a onCellKeyDown. Generiamo direttamente la richiesta.
-                setTimeout(() => {
-                    if (params.node) {
-                        params.node.setDataValue('__sync_request', Date.now());
-                    }
-                }, 0);
                 return;
             }
 
@@ -2013,7 +2550,7 @@ function(params) {
 
     # Ctrl/Cmd+Enter dentro l'iframe AG Grid non sempre raggiunge il bottone
     # Streamlit esterno. Trasformiamo quindi lo shortcut in un evento tecnico
-    # della grid, che verra interpretato da Python come richiesta di sync.
+    # della grid; in questa versione il tasto non avvia piu alcun consolidamento.
     js_grid_keyboard_shortcuts = JsCode(r"""
 function(params) {
     const event = params && params.event;
@@ -2148,11 +2685,96 @@ class RowOptionsRenderer {
 }
 """)
 
+    weekly_row_options_renderer = JsCode(r"""
+class WeeklyRowOptionsRenderer {
+    init(params) {
+        this.params = params;
+        this.eGui = document.createElement('div');
+        this.eGui.style.display = 'flex';
+        this.eGui.style.alignItems = 'center';
+        this.eGui.style.justifyContent = 'center';
+        this.eGui.style.gap = '8px';
+        this.eGui.style.height = '100%';
+
+        const makeButton = (label, title) => {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.textContent = label;
+            button.title = title;
+            button.style.border = 'none';
+            button.style.background = 'transparent';
+            button.style.padding = '0 4px';
+            button.style.fontSize = '20px';
+            button.style.lineHeight = '1';
+            button.style.fontWeight = '700';
+            button.style.cursor = 'pointer';
+            return button;
+        };
+
+        const del = makeButton('x', 'Rimuovi riga');
+        const add = makeButton('+', 'Aggiungi riga sotto');
+        const stop = (event) => { event.preventDefault(); event.stopPropagation(); };
+        del.addEventListener('mousedown', stop);
+        add.addEventListener('mousedown', stop);
+
+        del.addEventListener('click', (event) => {
+            stop(event);
+            if (params.api.getDisplayedRowCount() <= 1) return;
+            params.api.stopEditing();
+            const oldIndex = params.node.rowIndex == null ? 0 : params.node.rowIndex;
+            params.api.applyTransaction({ remove: [params.data] });
+            const remaining = params.api.getDisplayedRowCount();
+            const targetNode = params.api.getDisplayedRowAtIndex(Math.min(oldIndex, remaining - 1));
+            if (targetNode) targetNode.setDataValue('__action_touch', Date.now());
+        });
+
+        add.addEventListener('click', (event) => {
+            stop(event);
+            params.api.stopEditing();
+            const id = (typeof crypto !== 'undefined' && crypto.randomUUID)
+                ? crypto.randomUUID()
+                : `weekly_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+            const row = {
+                option: '',
+                __row_id: id,
+                __action_touch: 0,
+                __sync_request: 0,
+                Alimento: null,
+                'Target settimanale (g)': 0.0
+            };
+            const currentIndex = params.node.rowIndex == null
+                ? params.api.getDisplayedRowCount() - 1
+                : params.node.rowIndex;
+            const tx = params.api.applyTransaction({ add: [row], addIndex: currentIndex + 1 });
+            const addedNode = tx && tx.add && tx.add.length ? tx.add[0] : null;
+            if (addedNode) addedNode.setDataValue('__action_touch', Date.now());
+        });
+
+        this.eGui.appendChild(del);
+        this.eGui.appendChild(add);
+        if (params.api.getDisplayedRowCount() <= 1) {
+            del.disabled = true;
+            del.style.opacity = '0.35';
+        }
+    }
+    getGui() { return this.eGui; }
+    refresh() { return false; }
+}
+""")
+
     day_options_list = list(GIORNI_MAP.values())
     pasti_options = ["Colazione", "Spuntino", "Pranzo", "Merenda", "Cena"]
 
-    # Un piano appena importato viene subito consolidato, cosi totali e cache Python
-    # sono coerenti gia dal primo rendering delle grid precompilate.
+    # Un piano importato ricostruisce prima il budget generico e poi le allocazioni.
+    if st.session_state.pop("diet_weekly_budget_import_needs_recalc", False):
+        _recalculate_weekly_budget(
+            food_dict,
+            food_js_db,
+            trigger="import_existing_diet",
+        )
+
+    # Gli slot giornalieri vengono quindi consolidati usando il catalogo completo.
+    # Le nuove selezioni UI saranno invece proposte solo dal budget consolidato.
     if st.session_state.pop("diet_import_needs_recalc", False):
         _recalculate_all_slots(
             day_options_list,
@@ -2162,39 +2784,272 @@ class RowOptionsRenderer {
             trigger="import_existing_diet",
         )
 
-    # ------------------------------------------------------------------
-    # 4. Lazy rendering: un solo giorno alla volta -> 5 grid invece di 35.
-    # ------------------------------------------------------------------
-    selected_day = st.radio(
-        "Giorno da modificare",
-        day_options_list,
-        horizontal=True,
-        key="diet_active_day",
-    )
+    # Migrazione one-shot per sessioni gia aperte quando viene caricata questa versione.
+    # Inizializza la baseline degli assegnati una sola volta; da qui in avanti lo
+    # snapshot cambia esclusivamente col pulsante dedicato al Budget.
+    if WEEKLY_BUDGET_ALLOCATED_KEY not in st.session_state:
+        if st.session_state.get("diet_loaded_plan_id") is not None:
+            st.session_state[WEEKLY_BUDGET_ALLOCATED_KEY] = (
+                _aggregate_allocated_grams_from_drafts(day_options_list, pasti_options)
+            )
+            if not st.session_state.get(WEEKLY_BUDGET_ITEMS_KEY):
+                _recalculate_weekly_budget(
+                    food_dict,
+                    food_js_db,
+                    trigger="session_migration_v3",
+                )
+        else:
+            st.session_state[WEEKLY_BUDGET_ALLOCATED_KEY] = {}
+        st.session_state["diet_budget_comparison_stale"] = False
 
+    if WEEKLY_BUDGET_GRID_KEY not in st.session_state:
+        initial_budget_df = _empty_weekly_budget()
+        initial_budget_df["__row_id"] = [
+            f"budget_{idx}" for idx in range(len(initial_budget_df))
+        ]
+        st.session_state[WEEKLY_BUDGET_GRID_KEY] = _normalize_weekly_budget_df(initial_budget_df)
+        st.session_state[WEEKLY_BUDGET_SIG_KEY] = _weekly_budget_signature(initial_budget_df)
+        st.session_state[WEEKLY_BUDGET_ITEMS_KEY] = []
+        st.session_state[WEEKLY_BUDGET_TOTALS_KEY] = _zero_totals()
+        st.session_state[WEEKLY_BUDGET_DIRTY_KEY] = False
+
+    # ------------------------------------------------------------------
+    # 4. Editor in due fasi: prima budget libero, poi distribuzione sui giorni.
+    # ------------------------------------------------------------------
     # Compatibilita con Streamlit < 1.37: senza fragment continua a
     # funzionare, ma la modifica della grid provochera un full rerun.
     fragment_decorator = getattr(st, "fragment", lambda func: func)
 
     @fragment_decorator
-    def _render_active_day(day):
-        st.markdown(f"### 📅 {day}")
-
-        # Riserva due blocchi stabili nell'albero Streamlit.
+    def _render_diet_editor():
+        # Riserva blocchi stabili nell'albero Streamlit. Il budget viene mostrato
+        # prima di qualsiasi selezione del giorno, cosi il calcolo puo essere
+        # completato senza ragionare inizialmente su lunedi/domenica.
         # Il riepilogo viene popolato dopo aver letto le risposte AG Grid,
         # ma il container esiste gia sopra le grid: evita il replace() di
         # st.empty(), che causava reflow/flicker degli iframe AG Grid.
+        weekly_budget_container = st.container()
+        budget_action_container = st.container()
+        budget_status_container = st.container()
+        day_selector_container = st.container()
         daily_overview_container = st.container()
-        sync_container = st.container()
-        sync_status_container = st.container()
+        distribution_action_container = st.container()
+        distribution_status_container = st.container()
         grids_container = st.container()
 
-        # Il bottone viene materializzato nel container SOLO dopo aver eseguito
-        # le grid. Visivamente resta sopra, ma lato Python le response AG Grid
-        # vengono acquisite prima di valutare il comando di consolidamento.
-        sync_clicked = False
-        grid_sync_requested = False
+        # I due cicli di aggiornamento sono intenzionalmente separati:
+        # 1) Budget: macro budget + confronto con le grammature RAW assegnate nei giorni.
+        # 2) Distribuzione: macro dei giorni/settimana, senza alcun controllo sul budget.
+        # I pulsanti sono materializzati dopo le grid per essere certi di aver acquisito
+        # l'ultima response AG Grid, ma restano visualmente nei container dedicati.
         meal_caption_slots = []
+
+        # --------------------------------------------------------------
+        # Budget settimanale generico: source of truth solo dopo il pulsante dedicato.
+        # --------------------------------------------------------------
+        with weekly_budget_container:
+            st.markdown("### Budget alimentare settimanale")
+            st.caption(
+                "Definisci prima gli alimenti e le grammature complessive della settimana. "
+                "Le medie macro e i residui usano solo l'ultimo aggiornamento confermato."
+            )
+
+            budget_left, budget_right = st.columns([3.2, 1.2])
+            with budget_left:
+                budget_raw_df = _normalize_weekly_budget_df(
+                    st.session_state.get(WEEKLY_BUDGET_GRID_KEY, _empty_weekly_budget())
+                )
+                st.session_state[WEEKLY_BUDGET_GRID_KEY] = budget_raw_df
+
+                budget_status_df, outside_budget = _weekly_budget_status_dataframe(
+                    day_options_list, pasti_options
+                )
+
+                # La colonna Assegnati legge DIRETTAMENTE lo snapshot prodotto dal
+                # pulsante Budget, non passa piu dai macro/item consolidati. In questo
+                # modo non puo tornare a zero per effetto di filtri/catalogo/cache.
+                assigned_map = {}
+                for allocated_name, allocated_grams in dict(
+                    st.session_state.get(WEEKLY_BUDGET_ALLOCATED_KEY, {}) or {}
+                ).items():
+                    key = _food_name_key(allocated_name)
+                    if key:
+                        assigned_map[key] = assigned_map.get(key, 0.0) + _safe_float(allocated_grams)
+
+                occurrence_map = {}
+                for occurrence_name, occurrence_count in dict(
+                    st.session_state.get(WEEKLY_BUDGET_OCCURRENCES_KEY, {}) or {}
+                ).items():
+                    key = _food_name_key(occurrence_name)
+                    if key:
+                        occurrence_map[key] = occurrence_map.get(key, 0) + int(occurrence_count or 0)
+
+                budget_grid_df = budget_raw_df.copy()
+                # Prima colonna visibile del riepilogo Budget: numero di presenze
+                # dell'alimento nella Distribuzione settimanale all'ultimo check Budget.
+                budget_grid_df.insert(0, "N. volte", [
+                    int(occurrence_map.get(_food_name_key(name), 0))
+                    if not pd.isna(name) else 0
+                    for name in budget_grid_df["Alimento"]
+                ])
+                budget_grid_df["Assegnati (g)"] = [
+                    round(assigned_map.get(_food_name_key(name), 0.0), 1)
+                    if not pd.isna(name) else 0.0
+                    for name in budget_grid_df["Alimento"]
+                ]
+                budget_grid_df["Residui (g)"] = (
+                    pd.to_numeric(budget_grid_df[WEEKLY_BUDGET_GRAMS_COL], errors="coerce").fillna(0.0)
+                    - pd.to_numeric(budget_grid_df["Assegnati (g)"], errors="coerce").fillna(0.0)
+                ).round(1)
+
+                budget_gb = GridOptionsBuilder.from_dataframe(budget_grid_df)
+                for hidden_col in (
+                    "::auto_unique_id::", "__row_id", "__action_touch", "__sync_request"
+                ):
+                    budget_gb.configure_column(
+                        hidden_col,
+                        hide=True,
+                        suppressColumnsToolPanel=True,
+                    )
+                budget_gb.configure_column(
+                    "N. volte",
+                    headerName="N. volte",
+                    editable=False,
+                    sortable=True,
+                    filter=False,
+                    resizable=False,
+                    pinned="left",
+                    type="numericColumn",
+                    width=88,
+                    minWidth=88,
+                    maxWidth=88,
+                )
+                budget_gb.configure_column(
+                    "option",
+                    headerName="option",
+                    editable=False,
+                    sortable=False,
+                    filter=False,
+                    resizable=False,
+                    pinned="left",
+                    width=92,
+                    minWidth=92,
+                    maxWidth=92,
+                    suppressColumnsToolPanel=True,
+                    cellRenderer=weekly_row_options_renderer,
+                )
+                budget_gb.configure_column(
+                    "Alimento",
+                    editable=True,
+                    singleClickEdit=True,
+                    cellEditor=food_autocomplete_editor,
+                    flex=2.0,
+                )
+                budget_gb.configure_column(
+                    WEEKLY_BUDGET_GRAMS_COL,
+                    editable=True,
+                    type="numericColumn",
+                    flex=1.25,
+                )
+                budget_gb.configure_column(
+                    "Assegnati (g)",
+                    editable=False,
+                    type="numericColumn",
+                    flex=1.0,
+                )
+                budget_gb.configure_column(
+                    "Residui (g)",
+                    editable=False,
+                    type="numericColumn",
+                    flex=1.0,
+                    cellStyle=JsCode("""
+                    function(params) {
+                        const v = Number(params.value || 0);
+                        if (v < 0) return {backgroundColor: '#FDE2E2', color: '#8B1E1E', fontWeight: '600'};
+                        if (v === 0) return {backgroundColor: '#EAF7EE', color: '#205C37'};
+                        return null;
+                    }
+                    """),
+                )
+                budget_gb.configure_grid_options(
+                    domLayout="normal",
+                    editable=True,
+                    context={"foodDb": food_js_db, "foodVersion": food_catalog_version},
+                    getRowId=JsCode("function(params) { return String(params.data.__row_id); }"),
+                )
+                budget_options = budget_gb.build()
+                budget_height = min(330, 42 + max(1, len(budget_grid_df)) * 35)
+
+                budget_kwargs = dict(
+                    gridOptions=budget_options,
+                    update_mode=GridUpdateMode.VALUE_CHANGED,
+                    allow_unsafe_jscode=True,
+                    fit_columns_on_grid_load=False,
+                    height=budget_height,
+                    theme="streamlit",
+                    key=f"ag_diet_weekly_budget_{int(st.session_state.get('diet_editor_revision', 0) or 0)}",
+                )
+                if _aggrid_supports_parameter("update_on"):
+                    budget_kwargs["update_on"] = []
+                if DataReturnMode is not None:
+                    budget_kwargs["data_return_mode"] = DataReturnMode.AS_INPUT
+                budget_callback_supported = _aggrid_supports_parameter("callback")
+                if budget_callback_supported:
+                    budget_kwargs["callback"] = _make_weekly_budget_capture_callback()
+                if _aggrid_supports_parameter("server_sync_strategy"):
+                    budget_kwargs["server_sync_strategy"] = "client_wins"
+
+                budget_response = AgGrid(budget_grid_df, **budget_kwargs)
+                if not budget_callback_supported:
+                    returned_budget_df = _extract_weekly_budget_dataframe(budget_response)
+                    if returned_budget_df is not None:
+                        old_budget_sig = _weekly_budget_signature(
+                            st.session_state.get(WEEKLY_BUDGET_GRID_KEY, _empty_weekly_budget())
+                        )
+                        new_budget_sig = _weekly_budget_signature(returned_budget_df)
+                        st.session_state[WEEKLY_BUDGET_GRID_KEY] = returned_budget_df
+                        st.session_state[WEEKLY_BUDGET_SIG_KEY] = new_budget_sig
+                        if old_budget_sig != new_budget_sig:
+                            st.session_state[WEEKLY_BUDGET_DIRTY_KEY] = True
+                            st.session_state["diet_budget_comparison_stale"] = True
+
+                if outside_budget:
+                    st.warning(
+                        "Sono presenti allocazioni giornaliere non incluse nel budget consolidato: "
+                        + ", ".join(sorted(outside_budget.keys()))
+                    )
+
+            with budget_right:
+                st.markdown("#### Medie giornaliere")
+                budget_totals = st.session_state.get(WEEKLY_BUDGET_TOTALS_KEY, _zero_totals())
+                st.metric("Kcal", f"{budget_totals['kcal'] / 7:.1f}")
+                st.metric("Carboidrati", f"{budget_totals['carbs'] / 7:.1f} g")
+                st.metric("Grassi", f"{budget_totals['fats'] / 7:.1f} g")
+                st.metric("Proteine", f"{budget_totals['prot'] / 7:.1f} g")
+                if st.session_state.get(WEEKLY_BUDGET_DIRTY_KEY, False):
+                    st.caption("Modifiche budget in attesa di aggiornamento.")
+                else:
+                    st.caption("Valori allineati al budget consolidato.")
+
+            st.markdown("---")
+
+        # Solo gli alimenti confermati nel budget vengono proposti nell'autocomplete giornaliero.
+        allocation_food_js_db = _weekly_budget_allowed_food_db(food_js_db)
+        if not allocation_food_js_db:
+            with weekly_budget_container:
+                st.info(
+                    "Consolida almeno un alimento nel budget prima di compilare i singoli giorni."
+                )
+
+        with day_selector_container:
+            st.markdown("### Distribuzione settimanale")
+            day = st.radio(
+                "Giorno da modificare",
+                day_options_list,
+                horizontal=True,
+                key="diet_active_day",
+            )
+            st.markdown(f"#### {day}")
 
         with grids_container:
             for pasto in pasti_options:
@@ -2295,17 +3150,16 @@ class RowOptionsRenderer {
                     gb.configure_grid_options(
                         domLayout="normal",
                         editable=True,
-                        context={"foodDb": food_js_db, "foodVersion": food_catalog_version},
+                        context={"foodDb": allocation_food_js_db, "foodVersion": food_catalog_version},
                         suppressColumnVirtualisation=False,
                         getRowId=JsCode("function(params) { return String(params.data.__row_id); }"),
                         onCellValueChanged=js_refresh_macro_columns,
-                        onCellKeyDown=js_grid_keyboard_shortcuts,
                     )
                     grid_options = gb.build()
 
                     # La modifica della grid viene rimandata a Python come semplice DRAFT.
                     # Il fragment limita il rerun alla sola giornata attiva; nessuna
-                    # aggregazione viene eseguita finche l'utente non preme Sync.
+                    # aggregazione viene eseguita finche l'utente non preme il pulsante Distribuzione.
                     # Altezza dinamica: compatta con poche righe, scroll oltre 7 righe.
                     grid_height = min(295, 42 + max(1, len(grid_df)) * 35)
 
@@ -2390,6 +3244,7 @@ class RowOptionsRenderer {
                             st.session_state[keys["sig"]] = returned_sig
                             if returned_sig != previous_sig:
                                 st.session_state["diet_aggregations_dirty"] = True
+                                st.session_state["diet_budget_comparison_stale"] = True
                                 st.session_state.pop("diet_micronutrient_overview_editor", None)
                                 st.session_state["diet_grid_rx_revision"] = int(
                                     st.session_state.get("diet_grid_rx_revision", 0) or 0
@@ -2408,62 +3263,109 @@ class RowOptionsRenderer {
                         session_df=_debug_df_payload(st.session_state.get(keys["grid"])),
                     )
 
-                    # Richiesta di sync proveniente da Ctrl/Cmd+Enter dentro AG Grid.
-                    sync_values = pd.to_numeric(
-                        edited_df["__sync_request"],
-                        errors="coerce",
-                    ).fillna(0)
-                    latest_sync_request = int(sync_values.max()) if len(sync_values) else 0
-                    last_sync_request = int(
-                        st.session_state.get("diet_last_grid_sync_request", 0) or 0
-                    )
-                    if latest_sync_request > last_sync_request:
-                        st.session_state["diet_last_grid_sync_request"] = latest_sync_request
-                        grid_sync_requested = True
-
                     # Riserviamo la posizione della caption ma la valorizziamo solo
                     # dopo aver letto tutte le grid. In questo modo, se viene richiesto
-                    # un Sync, tutte le caption mostrano la stessa snapshot Python.
+                    # un aggiornamento, tutte le caption mostrano la stessa snapshot Python.
                     meal_caption_container = st.container()
                     meal_caption_slots.append((meal_caption_container, pasto, keys))
 
-        # Il bottone e scritto ora nel container creato sopra: visivamente resta
-        # prima delle grid, ma il codice ha gia acquisito tutti i draft disponibili.
-        with sync_container:
-            sync_clicked = _button_with_optional_shortcut(
-                "🔄 Aggiorna totali / aggregazioni",
-                shortcut="Ctrl+Enter",
-                key="sync_diet_aggregations",
+        # I pulsanti vengono valutati solo dopo aver acquisito le response delle grid.
+        # Restano pero visualmente nelle rispettive sezioni grazie ai container creati sopra.
+        with budget_action_container:
+            budget_update_clicked = st.button(
+                "🔄 Aggiorna i valori medi del Budget alimentare",
+                key="update_weekly_budget_values",
                 help=(
-                    "Consolida in Python i dati RAW gia ricevuti dalle grid e aggiorna "
-                    "insieme totali per pasto, giorno e settimana."
+                    "Aggiorna i macro medi del Budget e confronta, alimento per alimento, "
+                    "il target settimanale con la somma delle grammature attualmente assegnate "
+                    "nelle grid della Distribuzione. Non ricalcola i macro della Distribuzione."
                 ),
                 use_container_width=True,
             )
 
-        # Il consolidamento avviene DOPO aver acquisito le response di tutte le grid:
-        # cosi anche l'ultima modifica committata entra nello stesso snapshot.
-        if sync_clicked or grid_sync_requested:
+        with distribution_action_container:
+            distribution_update_clicked = st.button(
+                "🔄 Aggiorna valori medi della Distribuzione settimanale",
+                key="update_weekly_distribution_values",
+                help=(
+                    "Ricalcola esclusivamente macro e medie della Distribuzione settimanale. "
+                    "Non esegue alcun confronto o controllo rispetto al Budget alimentare."
+                ),
+                use_container_width=True,
+            )
+
+        if budget_update_clicked:
             _diag_log(
-                "sync_requested",
+                "budget_update_requested",
                 active_day=day,
-                source="button" if sync_clicked else "grid_shortcut",
+                budget_draft=_debug_df_payload(st.session_state.get(WEEKLY_BUDGET_GRID_KEY)),
+            )
+
+            # 1) Consolida SOLO il Budget e le sue medie.
+            _recalculate_weekly_budget(
+                food_dict,
+                food_js_db,
+                trigger="budget_update_button",
+            )
+
+            # 2) Legge le grammature RAW della Distribuzione senza ricalcolarne i macro.
+            # Questo snapshot alimenta esclusivamente Assegnati/Residui del Budget.
+            allocated_now = _aggregate_allocated_grams_from_drafts(
+                day_options_list, pasti_options
+            )
+            occurrences_now = _aggregate_allocated_occurrences_from_drafts(
+                day_options_list, pasti_options
+            )
+            st.session_state[WEEKLY_BUDGET_ALLOCATED_KEY] = dict(allocated_now)
+            st.session_state[WEEKLY_BUDGET_OCCURRENCES_KEY] = dict(occurrences_now)
+
+            comparison_df, budget_coherent = _budget_distribution_consistency(
+                day_options_list,
+                pasti_options,
+                budget_df=st.session_state.get(WEEKLY_BUDGET_GRID_KEY),
+            )
+            st.session_state["diet_budget_last_check_rows"] = comparison_df.to_dict(orient="records")
+            st.session_state["diet_budget_last_check_coherent"] = bool(budget_coherent)
+            st.session_state["diet_budget_comparison_stale"] = False
+
+            if budget_coherent:
+                st.session_state["diet_budget_flash_message"] = (
+                    "Budget aggiornato: per tutti gli alimenti i grammi assegnati sono uguali al target."
+                )
+            else:
+                counts = comparison_df["Stato"].value_counts().to_dict() if not comparison_df.empty else {}
+                st.session_state["diet_budget_flash_message"] = (
+                    "Budget aggiornato con confronto sulla Distribuzione: "
+                    f"{counts.get('ASSEGNATO < BUDGET', 0)} sotto target, "
+                    f"{counts.get('ASSEGNATO > BUDGET', 0)} sopra target, "
+                    f"{counts.get('FUORI BUDGET', 0)} fuori budget, "
+                    f"{counts.get('COERENTE', 0)} coerenti."
+                )
+            _rerun_after_numeric_sync()
+
+        if distribution_update_clicked:
+            _diag_log(
+                "distribution_update_requested",
+                active_day=day,
                 active_day_snapshot={
                     meal: _debug_df_payload(st.session_state.get(_slot_keys(day, meal)["grid"]))
                     for meal in pasti_options
                 },
-                active_day_basic_valid={
-                    meal: _basic_valid_rows(st.session_state.get(_slot_keys(day, meal)["grid"]))
-                    for meal in pasti_options
-                },
             )
+            # Ricalcola SOLO gli slot e le aggregazioni della Distribuzione.
+            # Nessuna lettura/validazione dei target del Budget viene eseguita qui.
             _recalculate_all_slots(
                 day_options_list,
                 pasti_options,
                 food_dict,
                 food_js_db,
-                trigger="button" if sync_clicked else "grid_shortcut",
+                trigger="distribution_update_button",
             )
+            st.session_state["diet_distribution_flash_message"] = (
+                "Valori medi della Distribuzione settimanale aggiornati. "
+                "Nessun controllo rispetto al Budget e stato eseguito."
+            )
+            _rerun_after_numeric_sync()
 
         for meal_caption_container, pasto, keys in meal_caption_slots:
             meal_totals = st.session_state.get(keys["totals"], _zero_totals())
@@ -2476,16 +3378,40 @@ class RowOptionsRenderer {
                     f"Proteine **{meal_totals['prot']:.1f} g**"
                 )
 
-        # Lo stato viene scritto solo dopo aver letto tutte le grid del rerun,
-        # cosi il messaggio riflette davvero la presenza di modifiche pending.
-        with sync_status_container:
-            if st.session_state.get("diet_aggregations_dirty", False):
+        # Stato Budget: indipendente dalle medie della Distribuzione.
+        with budget_status_container:
+            budget_flash = st.session_state.pop("diet_budget_flash_message", None)
+            if budget_flash:
+                if st.session_state.get("diet_budget_last_check_coherent", False):
+                    st.success(budget_flash)
+                else:
+                    st.warning(budget_flash)
+
+            if st.session_state.get(WEEKLY_BUDGET_DIRTY_KEY, False):
                 st.caption(
-                    "⚠️ Le grid contengono modifiche non ancora consolidate nei totali. "
-                    "Premi il pulsante oppure Ctrl+Enter."
+                    "⚠️ Budget modificato: premi 'Aggiorna i valori medi del Budget alimentare' "
+                    "per aggiornare medie, Assegnati e Residui."
+                )
+            elif st.session_state.get("diet_budget_comparison_stale", False):
+                st.caption(
+                    "⚠️ La Distribuzione e stata modificata dopo l'ultimo confronto del Budget. "
+                    "Assegnati/Residui restano riferiti all'ultimo controllo esplicito del Budget."
                 )
             else:
-                st.caption("✅ Totali Python allineati all'ultimo consolidamento.")
+                st.caption("✅ Budget consolidato e confronto con la Distribuzione aggiornato.")
+
+        # Stato Distribuzione: nessun controllo con il Budget viene fatto qui.
+        with distribution_status_container:
+            distribution_flash = st.session_state.pop("diet_distribution_flash_message", None)
+            if distribution_flash:
+                st.success(distribution_flash)
+            if st.session_state.get("diet_aggregations_dirty", False):
+                st.caption(
+                    "⚠️ Distribuzione modificata: premi 'Aggiorna valori medi della Distribuzione settimanale' "
+                    "per aggiornare macro e medie."
+                )
+            else:
+                st.caption("✅ Medie della Distribuzione aggiornate all'ultimo consolidamento.")
 
         # Diagnostica estesa: copia/scarica questo blocco dopo aver riprodotto il bug.
         with st.expander("🧪 Log diagnostico AG Grid → Python", expanded=False):
@@ -2539,7 +3465,7 @@ class RowOptionsRenderer {
 
             st.caption(
                 "Per un test pulito: azzera il log → modifica un alimento → modifica i grammi "
-                "→ premi Aggiorna totali → premi Salva → scarica il log e inoltramelo. "
+                "→ usa il pulsante della sezione interessata → premi Salva → scarica il log e inoltramelo. "
                 "I messaggi [DIET-GRID-DEBUG] sono visibili anche nella console del browser."
             )
 
@@ -2670,107 +3596,177 @@ class RowOptionsRenderer {
 
         if update_clicked or save_new_clicked:
             action_name = "update" if update_clicked else "save_new"
+            normalized_name = (diet_name or "").strip()
 
-            # Prima della persistenza consolidiamo sempre l'ultimo stato ricevuto
-            # da tutte le grid, anche se l'utente non ha premuto Sync.
+            # CHECK BLOCCANTE PRE-PERSISTENZA.
+            # Viene eseguito sui RAW correnti delle due sezioni e NON dipende dal fatto
+            # che l'utente abbia premuto o meno i due pulsanti di aggiornamento medie.
+            consistency_df, is_coherent = _budget_distribution_consistency(
+                day_options_list,
+                pasti_options,
+                budget_df=st.session_state.get(WEEKLY_BUDGET_GRID_KEY),
+            )
+            raw_budget_targets = _aggregate_budget_targets_from_draft(
+                st.session_state.get(WEEKLY_BUDGET_GRID_KEY)
+            )
+            raw_allocated = _aggregate_allocated_grams_from_drafts(
+                day_options_list, pasti_options
+            )
+
+            invalid_budget_foods = sorted({
+                name for name in raw_budget_targets
+                if name not in food_dict
+            })
+            invalid_distribution_foods = sorted({
+                name for name in raw_allocated
+                if name not in food_dict
+            })
+
             _diag_log(
-                "persist_clicked_before_recalculate",
+                "persist_consistency_check",
                 action=action_name,
                 active_day=day,
-                rx_revision=st.session_state.get("diet_grid_rx_revision", 0),
+                coherent=is_coherent,
+                rows=consistency_df.to_dict(orient="records"),
+                invalid_budget_foods=invalid_budget_foods,
+                invalid_distribution_foods=invalid_distribution_foods,
             )
-            _recalculate_all_slots(
-                day_options_list,
-                pasti_options,
-                food_dict,
-                food_js_db,
-                trigger=f"{action_name}_button",
-            )
-
-            temp_processed_items = _collect_cached_items(
-                day_options_list,
-                pasti_options,
-            )
-            normalized_name = (diet_name or "").strip()
 
             if not normalized_name:
                 st.error("Inserisci un nome per il piano alimentare.")
-            elif not temp_processed_items:
-                total_draft_rows = sum(
-                    _count_valid_rows(
-                        st.session_state.get(_slot_keys(d, m)["grid"]),
-                        food_dict,
-                    )
-                    for d in day_options_list
-                    for m in pasti_options
+
+            elif not raw_budget_targets:
+                st.warning(
+                    "Salvataggio bloccato: definisci almeno un alimento con grammatura positiva "
+                    "nel Budget alimentare."
                 )
-                st.error(
-                    "Nessun alimento valido disponibile per il salvataggio. "
-                    f"Python vede attualmente {total_draft_rows} righe valide nelle grid."
+
+            elif not is_coherent:
+                st.warning(
+                    "⚠️ Salvataggio bloccato: Budget alimentare e Distribuzione settimanale "
+                    "non sono coerenti. Per ogni alimento i grammi del Budget devono essere "
+                    "uguali alla somma dei grammi realmente assegnati nei giorni."
                 )
+                inconsistent_df = consistency_df.loc[
+                    consistency_df["Stato"] != "COERENTE"
+                ].copy()
+                st.dataframe(
+                    inconsistent_df if not inconsistent_df.empty else consistency_df,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            elif invalid_budget_foods or invalid_distribution_foods:
+                invalid_names = sorted(set(invalid_budget_foods) | set(invalid_distribution_foods))
+                st.warning(
+                    "⚠️ Salvataggio bloccato: alcuni alimenti non sono piu presenti nel catalogo "
+                    "corrente e non possono essere persistiti correttamente: "
+                    + ", ".join(invalid_names)
+                )
+
             else:
-                diet_payload = {
-                    "patient_id": current_patient_id,
-                    "user_id": user_id,
-                    "diet_name": normalized_name,
-                    "descrizione": descrizione,
-                    "warnings": warnings,
-                }
+                # Solo DOPO il check di coerenza consolidiamo i due domini per costruire
+                # il payload persistibile. Il controllo e gia passato sui dati RAW correnti.
+                weekly_budget_items, _ = _recalculate_weekly_budget(
+                    food_dict,
+                    food_js_db,
+                    trigger=f"{action_name}_after_consistency_check",
+                )
+                _recalculate_all_slots(
+                    day_options_list,
+                    pasti_options,
+                    food_dict,
+                    food_js_db,
+                    trigger=f"{action_name}_after_consistency_check",
+                )
 
-                try:
-                    if save_new_clicked:
-                        # Nuovo piano: il nome deve essere univoco per l'assistito.
-                        if diet_name_exists(
-                            tec_conf,
-                            current_patient_id,
-                            normalized_name,
-                        ):
-                            st.error(
-                                f"Esiste gia un piano alimentare chiamato '{normalized_name}' "
-                                "per questo assistito. Scegli un nome diverso."
-                            )
-                        else:
-                            new_diet_id = add_diet_plan(
+                temp_processed_items = _collect_cached_items(
+                    day_options_list,
+                    pasti_options,
+                )
+
+                if not weekly_budget_items:
+                    st.warning(
+                        "Salvataggio bloccato: il Budget non contiene alimenti validi consolidabili."
+                    )
+                elif not temp_processed_items:
+                    st.warning(
+                        "Salvataggio bloccato: la Distribuzione non contiene alimenti validi persistibili."
+                    )
+                else:
+                    # Lo snapshot del Budget viene allineato solo dopo un check riuscito.
+                    st.session_state[WEEKLY_BUDGET_ALLOCATED_KEY] = dict(raw_allocated)
+                    st.session_state[WEEKLY_BUDGET_OCCURRENCES_KEY] = dict(
+                        _aggregate_allocated_occurrences_from_drafts(
+                            day_options_list, pasti_options
+                        )
+                    )
+                    st.session_state["diet_budget_last_check_rows"] = consistency_df.to_dict(orient="records")
+                    st.session_state["diet_budget_last_check_coherent"] = True
+                    st.session_state["diet_budget_comparison_stale"] = False
+
+                    diet_payload = {
+                        "patient_id": current_patient_id,
+                        "user_id": user_id,
+                        "diet_name": normalized_name,
+                        "descrizione": descrizione,
+                        "warnings": warnings,
+                    }
+
+                    try:
+                        if save_new_clicked:
+                            # Nuovo piano: il nome deve essere univoco per l'assistito.
+                            if diet_name_exists(
                                 tec_conf,
-                                diet_payload,
-                                temp_processed_items,
-                            )
-                            st.session_state["diet_flash_message"] = (
-                                f"Nuovo piano '{normalized_name}' salvato con successo "
-                                f"(ID: {new_diet_id})."
-                            )
-                            _reset_diet_editor_state(clear_search=True)
-                            st.session_state["diet_editor_patient_id"] = current_patient_id
-                            st.rerun()
+                                current_patient_id,
+                                normalized_name,
+                            ):
+                                st.error(
+                                    f"Esiste gia un piano alimentare chiamato '{normalized_name}' "
+                                    "per questo assistito. Scegli un nome diverso."
+                                )
+                            else:
+                                new_diet_id = add_diet_plan(
+                                    tec_conf,
+                                    diet_payload,
+                                    temp_processed_items,
+                                )
+                                st.session_state["diet_flash_message"] = (
+                                    f"Nuovo piano '{normalized_name}' salvato con successo "
+                                    f"(ID: {new_diet_id})."
+                                )
+                                _reset_diet_editor_state(clear_search=True)
+                                st.session_state["diet_editor_patient_id"] = current_patient_id
+                                st.rerun()
 
-                    else:
-                        loaded_id = st.session_state.get("diet_loaded_plan_id")
-                        if loaded_id is None:
-                            st.error("Importa prima un piano alimentare da aggiornare.")
-                        elif diet_name_exists(
-                            tec_conf,
-                            current_patient_id,
-                            normalized_name,
-                            exclude_diet_id=loaded_id,
-                        ):
-                            st.error(
-                                f"Esiste gia un altro piano alimentare chiamato '{normalized_name}' "
-                                "per questo assistito."
-                            )
                         else:
-                            update_diet_plan(
+                            loaded_id = st.session_state.get("diet_loaded_plan_id")
+                            if loaded_id is None:
+                                st.error("Importa prima un piano alimentare da aggiornare.")
+                            elif diet_name_exists(
                                 tec_conf,
-                                loaded_id,
-                                diet_payload,
-                                temp_processed_items,
-                            )
-                            st.session_state["diet_loaded_plan_name"] = normalized_name
-                            st.session_state["diet_flash_message"] = (
-                                f"Piano '{normalized_name}' aggiornato con successo."
-                            )
-                            st.rerun()
-                except Exception as exc:
-                    logger.error("Errore durante la persistenza del piano alimentare", exc_info=True)
-                    st.error(f"Errore durante il salvataggio del piano alimentare: {exc}")
+                                current_patient_id,
+                                normalized_name,
+                                exclude_diet_id=loaded_id,
+                            ):
+                                st.error(
+                                    f"Esiste gia un altro piano alimentare chiamato '{normalized_name}' "
+                                    "per questo assistito."
+                                )
+                            else:
+                                update_diet_plan(
+                                    tec_conf,
+                                    loaded_id,
+                                    diet_payload,
+                                    temp_processed_items,
+                                )
+                                st.session_state["diet_loaded_plan_name"] = normalized_name
+                                st.session_state["diet_flash_message"] = (
+                                    f"Piano '{normalized_name}' aggiornato con successo."
+                                )
+                                st.rerun()
+                    except Exception as exc:
+                        logger.error("Errore durante la persistenza del piano alimentare", exc_info=True)
+                        st.error(f"Errore durante il salvataggio del piano alimentare: {exc}")
 
-    _render_active_day(selected_day)
+    _render_diet_editor()

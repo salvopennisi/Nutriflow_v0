@@ -9,14 +9,23 @@
 ## Indice
 
 - [Stato attuale](#stato-attuale)
+
 - [Funzionalità implementate](#funzionalità-implementate)
+
 - [User Stories](#user-stories)
+
 - [Architettura](#architettura)
+
 - [Struttura del progetto](#struttura-del-progetto)
+
 - [Modello dati](#modello-dati)
+
 - [Logiche di calcolo](#logiche-di-calcolo)
+
 - [Installazione ed esecuzione](#installazione-ed-esecuzione)
+
 - [Test](#test)
+
 - [Known gaps e debito tecnico](#known-gaps-e-debito-tecnico)
 
 ---
@@ -28,22 +37,39 @@ Il progetto è attualmente una **web app multipagina Streamlit** con accesso dir
 Il flusso principale è:
 
 ```text
+
 Streamlit UI
-    │
-    ├── pages/1_pazienti.py
-    ├── pages/2_biometria.py
-    ├── pages/3_piani_alimentari.py
-    ├── pages/4_workout.py
-    └── pages/5_catalogo_alimenti.py
-    │
-    ▼
+
+    │
+
+    ├── pages/1_pazienti.py
+
+    ├── pages/2_biometria.py
+
+    ├── pages/3_piani_alimentari.py
+
+    ├── pages/4_workout.py
+
+    └── pages/5_catalogo_alimenti.py
+
+    │
+
+    ▼
+
 Backend/services/*.py
-    │
-    ▼
+
+    │
+
+    ▼
+
 Common/functions.py
-    │
-    ▼
+
+    │
+
+    ▼
+
 PostgreSQL
+
 ```
 
 Non è presente un API server applicativo: `Backend/main.py` è attualmente vuoto e le pagine Streamlit invocano direttamente i service Python.
@@ -51,15 +77,25 @@ Non è presente un API server applicativo: `Backend/main.py` è attualmente vuot
 ### Moduli realmente disponibili in UI
 
 | Modulo | Stato | Funzioni principali |
+
 |---|---|---|
+
 | Pazienti | ✅ Implementato | Creazione, ricerca, modifica, TDEE automatico/manuale |
+
 | Biometria | ✅ Implementato | Misure antropometriche, 7 pliche, BF%, proporzioni classiche/auree, storico |
-| Piani alimentari | ✅ Implementato | Editor 7×5, macro, import/clone/update, lista spesa, PDF, micronutrienti |
+
+| Piani alimentari | ✅ Implementato | Budget settimanale indipendente, distribuzione 7×5, confronto Budget/assegnato, macro, import/clone/update, lista spesa, PDF, micronutrienti |
+
 | Workout | ✅ Implementato | CRUD piani, esercizi/blocchi, tecniche, registrazione performance e trend |
+
 | Catalogo alimenti | ✅ Implementato | UI dedicata per lista, ricerca, inserimento, modifica, eliminazione e import massivo CSV/JSON |
+
 | Riferimenti micronutrienti | ⚙️ Service-only | CRUD tipologica disponibile nel backend |
+
 | Anamnesi strutturata | ⚙️ Parziale | Service per domande/risposte presente; UI attuale usa soprattutto campi testuali liberi |
+
 | Autenticazione/ruoli | 🚧 Non implementato | Esiste la tabella `users`, ma la UI usa un `user_id` placeholder |
+
 | Ricette | ❌ Non implementato | Non sono presenti service/UI attivi per ricette |
 
 ---
@@ -71,14 +107,23 @@ Non è presente un API server applicativo: `Backend/main.py` è attualmente vuot
 La pagina `pages/1_pazienti.py` consente di:
 
 - creare un nuovo assistito;
+
 - registrare nome, cognome, data di nascita, sesso, altezza e peso iniziale;
+
 - associare stile di vita/PAL, professione, storia/anamnesi libera e patologie/note cliniche;
+
 - ricercare gli assistiti per nome, cognome o professione;
+
 - modificare i dati di un assistito esistente;
+
 - visualizzare l'ultimo peso disponibile ricavato dallo storico biometrico;
+
 - calcolare e memorizzare il TDEE;
+
 - applicare una correzione professionale percentuale al TDEE stimato;
+
 - salvare un TDEE manuale quando il professionista vuole sostituire la stima algoritmica con un valore osservato;
+
 - registrare un nuovo peso nello storico biometrico quando, durante il ricalcolo TDEE, il peso è effettivamente cambiato.
 
 ### TDEE
@@ -86,29 +131,41 @@ La pagina `pages/1_pazienti.py` consente di:
 Il codice implementa la stima del metabolismo basale tramite la formula:
 
 ```text
+
 BMR = 10 × peso_kg + 6.25 × altezza_cm - 5 × età + costante_sesso
+
 ```
 
 con:
 
 - `+5` per Maschio;
+
 - `-161` per Femmina.
 
 Il TDEE viene quindi calcolato come:
 
 ```text
+
 TDEE_stimato = BMR × PAL
+
 TDEE_adottato = TDEE_stimato × fattore_correzione_professionista
+
 ```
 
 Fattori PAL implementati:
 
 | Livello attività | PAL |
+
 |---|---:|
+
 | Sedentario | 1.20 |
+
 | Leggermente attivo | 1.30 |
+
 | Moderatamente attivo | 1.425 |
+
 | Molto attivo | 1.575 |
+
 | Estremamente attivo | 1.725 |
 
 La correzione professionista è configurabile nell'intervallo `-30% / +30%`.
@@ -124,10 +181,15 @@ La pagina `pages/2_biometria.py` consente di selezionare un assistito e lavorare
 La UI mostra una sintesi dell'ultima misurazione disponibile, inclusi quando presenti:
 
 - peso;
+
 - massa grassa BF%;
+
 - circonferenza vita;
+
 - torace;
+
 - spalle;
+
 - dettaglio completo degli altri parametri registrati.
 
 ### Nuova misurazione
@@ -135,17 +197,29 @@ La UI mostra una sintesi dell'ultima misurazione disponibile, inclusi quando pre
 È possibile registrare:
 
 - peso;
+
 - vita;
+
 - fianchi;
+
 - torace;
+
 - spalle;
+
 - collo;
+
 - polso;
+
 - braccia;
+
 - avambracci;
+
 - coscia;
+
 - polpacci;
+
 - data di riferimento;
+
 - sette pliche cutanee.
 
 ### Calcolo BF% - Jackson-Pollock 7 pliche
@@ -155,11 +229,17 @@ Il backend implementa il calcolo della densità corporea tramite **Jackson-Pollo
 Le pliche richieste sono:
 
 - petto;
+
 - addome;
+
 - coscia;
+
 - tricipite;
+
 - sovrascapolare;
+
 - sovrailiaca;
+
 - ascellare.
 
 ### Proporzioni classiche e auree
@@ -167,13 +247,17 @@ Le pliche richieste sono:
 Il backend implementa due modalità di confronto tra misure reali e target teorici:
 
 1. **Metodo basato sul polso**, con rapporti di proporzione classica/McCallum;
+
 2. **Metodo basato sulla vita**, che utilizza il rapporto aureo `φ ≈ 1.618` e, quando disponibile, anche il rapporto vita/altezza.
 
 La UI permette di:
 
 - selezionare un intervallo temporale;
+
 - scegliere una rilevazione corrente;
+
 - confrontarla con la prima rilevazione del periodo;
+
 - visualizzare target ideale, misura attuale e misura iniziale.
 
 ### Storico
@@ -184,58 +268,184 @@ Il service espone l'intero storico biometrico del paziente e la UI ne visualizza
 
 ## 3. Piani Alimentari 🥗
 
-La pagina `pages/3_piani_alimentari.py` è il modulo più articolato dell'applicazione.
+La pagina `pages/3_piani_alimentari.py` è il modulo più articolato dell'applicazione e separa esplicitamente **Budget alimentare**, **Distribuzione settimanale** e **Persistenza** per ridurre i problemi di sincronizzazione legati ai rerun di Streamlit.
 
 ### Gestione dei piani esistenti
 
 Per ogni assistito è possibile:
 
 - visualizzare i piani alimentari già salvati;
+
 - espandere il dettaglio del singolo piano;
+
 - visualizzare alimenti, quantità e macro calcolati;
+
 - eliminare definitivamente un piano con conferma esplicita;
+
 - generare un PDF;
+
 - visualizzare la lista della spesa aggregata;
+
 - calcolare on-demand l'overview dei micronutrienti.
 
-### Editor settimanale
+### Budget alimentare settimanale
 
-Ogni piano è organizzato su **7 giorni** e **5 pasti**:
+Prima della distribuzione sui singoli giorni l'utente può costruire un **Budget alimentare settimanale indipendente dai giorni**, indicando gli alimenti e la quantità complessiva prevista per l'intera settimana.
+
+Il riepilogo del Budget utilizza come prime colonne informative:
+
+| Campo | Significato |
+
+|---|---|
+
+| N. volte | Numero di occorrenze dell'alimento nella Distribuzione settimanale con grammatura maggiore di 0 |
+
+| Alimento | Alimento presente nel Budget |
+
+| Budget settimanale (g) | Quantità totale prevista per la settimana |
+
+| Assegnati (g) | Somma delle grammature realmente presenti nelle grid giorno/pasto |
+
+| Residui (g) | Differenza tra Budget e quantità assegnata |
+
+Il residuo viene sempre derivato come:
 
 ```text
+
+Residuo = Budget settimanale - Assegnati
+
+```
+
+Il valore può quindi essere:
+
+- positivo quando la quantità assegnata è inferiore al Budget;
+
+- zero quando Budget e Distribuzione coincidono;
+
+- negativo quando la quantità distribuita supera il Budget.
+
+A destra della grid vengono mostrate le medie giornaliere del Budget:
+
+- kcal;
+
+- carboidrati;
+
+- grassi;
+
+- proteine.
+
+Le medie sono calcolate come:
+
+```text
+
+media giornaliera = totale nutrizionale del Budget settimanale / 7
+
+```
+
+Il Budget diventa consolidato solo tramite il pulsante **Aggiorna i valori medi del Budget alimentare**.
+
+Alla pressione del pulsante il sistema:
+
+1. acquisisce l'ultima versione della grid Budget;
+
+2. ricalcola i macro e le medie giornaliere del Budget;
+
+3. legge direttamente le grammature RAW presenti in tutte le grid giorno/pasto;
+
+4. aggrega per alimento i grammi realmente assegnati;
+
+5. aggiorna **N. volte**, **Assegnati** e **Residui**;
+
+6. classifica ogni alimento come sotto Budget, coerente, sopra Budget o fuori Budget.
+
+Questa azione **non ricalcola i macro della Distribuzione settimanale**.
+
+### Distribuzione settimanale
+
+Dopo aver definito il Budget, il piano viene distribuito su **7 giorni** e **5 pasti**:
+
+```text
+
 Lunedì ... Domenica
-    ├── Colazione
-    ├── Spuntino
-    ├── Pranzo
-    ├── Merenda
-    └── Cena
+
+├── Colazione
+
+├── Spuntino
+
+├── Pranzo
+
+├── Merenda
+
+└── Cena
+
 ```
 
 Per ogni pasto l'utente può:
 
 - aggiungere nuove righe;
+
 - rimuovere righe;
+
 - cercare/selezionare un alimento tramite autocomplete AG Grid;
+
 - indicare i grammi;
-- vedere kcal, carboidrati, grassi e proteine calcolati proporzionalmente;
-- consolidare i dati nel backend Python tramite il pulsante **Aggiorna totali / aggregazioni** o shortcut `Ctrl+Enter` / `Cmd+Enter` quando supportato.
+
+- vedere kcal, carboidrati, grassi e proteine calcolati proporzionalmente.
+
+L'autocomplete della Distribuzione propone gli alimenti consolidati nel Budget settimanale.
 
 I macronutrienti degli alimenti sono considerati valori per **100 g** e vengono ricalcolati in funzione della quantità inserita.
 
-### Aggregazioni
+La Distribuzione dispone di un proprio comando indipendente: **Aggiorna valori medi della Distribuzione settimanale**.
+
+Alla pressione del pulsante vengono aggiornati esclusivamente:
+
+- macro per pasto;
+
+- aggregazioni giornaliere;
+
+- aggregazioni settimanali;
+
+- medie nutrizionali della Distribuzione.
+
+L'operazione **non esegue alcun controllo rispetto al Budget alimentare** e non modifica N. volte, Assegnati o Residui del riepilogo Budget.
+
+### Separazione dei cicli di aggiornamento
+
+Budget, Distribuzione e salvataggio sono trattati come tre dinamiche distinte:
+
+| Azione | Budget | Distribuzione | Check coerenza |
+
+|---|---:|---:|---:|
+
+| Aggiorna i valori medi del Budget alimentare | ✅ Aggiorna | ❌ Non ricalcola i macro | ✅ Confronto informativo |
+
+| Aggiorna valori medi della Distribuzione settimanale | ❌ Non modifica | ✅ Aggiorna | ❌ Nessun controllo |
+
+| Aggiorna/Salva piano | ✅ Legge RAW corrente | ✅ Legge RAW corrente | ✅ Bloccante |
+
+Questa separazione evita che una modifica in una sezione provochi automaticamente il ricalcolo dell'altra durante i rerun Streamlit.
+
+### Aggregazioni della Distribuzione
 
 Il modulo mantiene aggregazioni a tre livelli:
 
 - **per pasto**;
+
 - **per giorno**;
+
 - **per settimana**.
 
-L'overview settimanale mostra:
+L'overview settimanale della Distribuzione mostra:
 
 - kcal totali della settimana;
+
 - kcal medie giornaliere;
+
 - carboidrati medi giornalieri;
+
 - grassi medi giornalieri;
+
 - proteine medie giornaliere.
 
 ### Import, modifica e clonazione
@@ -245,10 +455,58 @@ L'overview settimanale mostra:
 Dopo l'import l'utente può:
 
 - aggiornare il piano originale;
+
 - usare il piano come base e salvarlo come **nuovo piano**;
+
 - ripartire da un piano vuoto.
 
+All'apertura di un piano esistente:
+
+- le grid giorno/pasto vengono ricostruite dagli item persistiti;
+
+- il Budget viene ricostruito aggregando le grammature salvate per alimento;
+
+- **Assegnati** viene inizializzato con le quantità già persistite;
+
+- **N. volte** viene ricostruito contando le occorrenze con grammatura maggiore di 0.
+
+Poiché il Budget non dispone ancora di una persistenza DB separata, per un piano riaperto il target iniziale del Budget coincide con la somma delle allocazioni salvate.
+
 Il backend applica l'unicità del nome del piano **per assistito**, ignorando differenze di maiuscole/minuscole e spazi esterni.
+
+### Controllo di coerenza prima del salvataggio
+
+Le azioni:
+
+- **Aggiorna piano alimentare esistente**;
+
+- **Salva come nuovo piano alimentare**;
+
+eseguono sempre un controllo di coerenza indipendente sui dati RAW correnti, anche se l'utente non ha premuto prima i pulsanti di aggiornamento del Budget o della Distribuzione.
+
+Per ogni alimento deve essere verificata la condizione:
+
+```text
+
+Budget settimanale = Σ grammature realmente assegnate nei giorni/pasti
+
+```
+
+Il salvataggio viene bloccato quando:
+
+- Assegnati < Budget;
+
+- Assegnati > Budget;
+
+- esiste un alimento nella Distribuzione ma non nel Budget;
+
+- il Budget è vuoto;
+
+- un alimento utilizzato non è più presente nel catalogo corrente.
+
+In presenza di incoerenze viene mostrato un warning e una tabella con il dettaglio degli alimenti non coerenti.
+
+Solo dopo il superamento del controllo vengono consolidati Budget e Distribuzione e viene costruito il payload persistibile.
 
 ### Persistenza atomica
 
@@ -257,10 +515,15 @@ Creazione e aggiornamento di un piano avvengono in transazione.
 In aggiornamento il dettaglio viene sostituito completamente:
 
 ```text
+
 UPDATE diet_plans
+
 DELETE old diet_meal_items
+
 INSERT new diet_meal_items
+
 COMMIT
+
 ```
 
 In caso di errore viene effettuato il rollback dell'intera operazione.
@@ -270,9 +533,13 @@ In caso di errore viene effettuato il rollback dell'intera operazione.
 La lista della spesa aggrega le quantità dello stesso alimento sull'intera settimana e produce una tabella del tipo:
 
 | Alimento | Quantità totale (g) |
+
 |---|---:|
+
 | Riso | 700 |
+
 | Pollo | 900 |
+
 | ... | ... |
 
 La stessa aggregazione viene inclusa nel PDF del piano.
@@ -282,11 +549,17 @@ La stessa aggregazione viene inclusa nel PDF del piano.
 Il PDF viene generato in memoria con **ReportLab** e contiene:
 
 1. nome del piano e assistito;
+
 2. descrizione/obiettivi;
+
 3. eventuali avvertenze o note cliniche;
+
 4. macro aggregati per giorno;
+
 5. lista della spesa settimanale;
+
 6. una pagina di dettaglio per ogni giorno con pasti, alimenti, grammi e macro;
+
 7. numerazione pagina e footer.
 
 ### Overview micronutrienti
@@ -296,10 +569,15 @@ Il calcolo è eseguito **on-demand** e non ad ogni modifica dell'editor, per evi
 Il backend:
 
 - recupera dal catalogo `foods` i micronutrienti per 100 g;
+
 - calcola l'apporto totale del piano;
+
 - divide il totale per 7 giorni;
+
 - confronta l'apporto medio giornaliero con la tipologica `micronutrients_quantities`;
+
 - gestisce riferimenti per MJ trasformandoli in funzione dell'energia media effettiva della dieta;
+
 - evita confronti quando l'unità/base nutrizionale del dato non è semanticamente compatibile con il riferimento.
 
 Sono mappati **25 micronutrienti**, tra vitamine, minerali, omega-3 e omega-6.
@@ -307,12 +585,19 @@ Sono mappati **25 micronutrienti**, tra vitamine, minerali, omega-3 e omega-6.
 Stati visualizzati in UI:
 
 | Stato | Significato |
+
 |---|---|
+
 | 🟢 OK | Riferimento rispettato |
+
 | 🟠 LOW_PRI / LOW_AI | Apporto sotto PRI/AI |
+
 | 🔴 HIGH_UL | Superamento di un limite UL applicabile |
+
 | 🟡 HIGH_WARNING | Superamento di un safe level/livello prudenziale |
+
 | 🩶 NOT_COMPARABLE | Base nutrizionale non confrontabile |
+
 | 🩶 NO_REFERENCE | Riferimento non configurato |
 
 ---
@@ -322,20 +607,31 @@ Stati visualizzati in UI:
 `Backend/services/food_service.py` implementa operazioni CRUD per:
 
 - categorie alimentari;
+
 - alimenti;
+
 - micronutrienti/riferimenti nutrizionali.
 
 Il catalogo alimenti supporta:
 
 - catalogo condiviso tra i nutrizionisti nell'MVP;
+
 - ricerca, inserimento, modifica ed eliminazione dalla UI `pages/5_catalogo_alimenti.py`;
+
 - import massivo da CSV o JSON con anteprima e validazione;
+
 - gestione dei duplicati per nome tramite strategia `skip` o `update`;
+
 - macronutrienti;
+
 - indice glicemico;
+
 - vitamine;
+
 - minerali;
+
 - omega-3 e omega-6;
+
 - peculiarità nutrizionali.
 
 > La separazione dei cibi per `user_id` non fa parte dell'MVP. La colonna resta nel modello come predisposizione futura, ma il catalogo corrente non applica filtri o ownership per nutrizionista.
@@ -347,11 +643,13 @@ Il catalogo alimenti supporta:
 `patient_service.py` contiene service per:
 
 - recuperare un template di domande di anamnesi ordinato per `order_index`;
+
 - salvare le risposte di un assistito sostituendo atomicamente il set precedente.
 
 Le tabelle coinvolte sono:
 
 - `anamnesis_questions`;
+
 - `anamnesis_answers`.
 
 > La UI corrente non espone ancora il questionario strutturato: nella pagina Pazienti sono presenti principalmente `descrizione_storia` e `patologie` come campi testuali liberi.
@@ -365,13 +663,21 @@ La pagina `pages/4_workout.py` introduce un modulo dedicato alla prescrizione e 
 Il modulo utilizza il service `Backend/services/workout_service.py` e il modello dati a tre tabelle:
 
 ```text
+
 workout_plans
-      │ 1:N
-      ▼
+
+      │ 1:N
+
+      ▼
+
 workout_exercises
-      │ 1:N
-      ▼
+
+      │ 1:N
+
+      ▼
+
 workout_measurements
+
 ```
 
 ### Listing e gestione dei workout
@@ -379,11 +685,17 @@ workout_measurements
 Per ogni assistito è possibile:
 
 - visualizzare i workout attivi;
+
 - includere nel listing anche i workout archiviati;
+
 - creare un nuovo workout;
+
 - modificare un workout esistente;
+
 - archiviare logicamente un workout senza perdere esercizi e misurazioni;
+
 - ripristinare un workout archiviato;
+
 - visualizzare il numero di esercizi, il numero di misurazioni e la data dell'ultima performance registrata.
 
 Il nome del workout è univoco per assistito tra i workout attivi, ignorando maiuscole/minuscole e spazi esterni.
@@ -393,22 +705,35 @@ Il nome del workout è univoco per assistito tra i workout attivi, ignorando mai
 Ogni workout contiene una lista ordinata di esercizi. Per ciascun esercizio è possibile configurare:
 
 - serie target;
+
 - range di ripetizioni minimo/massimo;
+
 - carico target;
+
 - TUT target;
+
 - recupero target;
+
 - RIR e RPE target;
+
 - note;
+
 - una o più metriche di progressione.
 
 Metriche supportate:
 
 ```text
+
 LOAD
+
 VOLUME
+
 TUT
+
 DENSITY
+
 REPS
+
 ```
 
 ### Blocchi multi-esercizio
@@ -418,12 +743,19 @@ Gli esercizi possono essere raggruppati tramite `block_id` e rappresentati nella
 Tipologie supportate:
 
 ```text
+
 STANDARD
+
 SUPERSET
+
 JUMP_SET
+
 TRI_SET
+
 GIANT_SET
+
 CIRCUIT
+
 ```
 
 Gli esercizi appartenenti allo stesso blocco condividono lo stesso `block_id` e possono specificare ordine e numero di round.
@@ -435,16 +767,27 @@ La modalità con cui un singolo esercizio viene eseguito è modellata separatame
 Tecniche supportate:
 
 ```text
+
 STANDARD
+
 DROP_SET
+
 REST_PAUSE
+
 MYO_REPS
+
 CLUSTER
+
 AMRAP
+
 TEMPO
+
 PAUSE_REPS
+
 PARTIAL_REPS
+
 BACK_OFF
+
 ```
 
 I parametri specifici delle tecniche sono salvati nel campo `technique_params` in formato `JSONB`, evitando di introdurre colonne dedicate per ogni tecnica.
@@ -452,10 +795,15 @@ I parametri specifici delle tecniche sono salvati nel campo `technique_params` i
 Esempio:
 
 ```json
+
 {
-  "drops": 2,
-  "load_reduction_pct": 20
+
+  "drops": 2,
+
+  "load_reduction_pct": 20
+
 }
+
 ```
 
 ### Modifica senza perdita dello storico
@@ -465,9 +813,13 @@ A differenza del dettaglio dei piani alimentari, durante l'aggiornamento di un w
 La strategia è:
 
 ```text
-esercizio esistente         → UPDATE mantenendo lo stesso UUID
-nuovo esercizio             → INSERT
+
+esercizio esistente         → UPDATE mantenendo lo stesso UUID
+
+nuovo esercizio             → INSERT
+
 esercizio rimosso dal piano → archived_at valorizzato
+
 ```
 
 In questo modo le foreign key presenti in `workout_measurements` restano valide e lo storico delle performance non viene perso.
@@ -481,20 +833,31 @@ Una seduta viene identificata tramite `execution_id`. Lo stesso identificativo p
 La granularità della misurazione è:
 
 ```text
+
 1 riga workout_measurements = 1 serie / segmento eseguito
+
 ```
 
 Campi principali registrabili:
 
 - numero serie;
+
 - numero segmento;
+
 - ripetizioni eseguite;
+
 - carico;
+
 - TUT;
+
 - recupero;
+
 - durata attiva;
+
 - RIR;
+
 - RPE;
+
 - note.
 
 `segment_number` permette di rappresentare tecniche che suddividono una stessa serie in più parti, ad esempio drop set, rest-pause o cluster.
@@ -502,11 +865,17 @@ Campi principali registrabili:
 Esempio drop set:
 
 ```text
+
 Serie | Segmento | Reps | Carico
+
 ------|----------|------|-------
-1     | 1        | 8    | 100 kg
-1     | 2        | 6    |  80 kg
-1     | 3        | 8    |  60 kg
+
+1     | 1        | 8    | 100 kg
+
+1     | 2        | 6    |  80 kg
+
+1     | 3        | 8    |  60 kg
+
 ```
 
 ### Trend e metriche derivate
@@ -514,22 +883,35 @@ Serie | Segmento | Reps | Carico
 Il backend aggrega le misurazioni per `execution_id` e calcola:
 
 - serie completate;
+
 - ripetizioni totali;
+
 - carico massimo;
+
 - volume;
+
 - TUT totale;
+
 - recupero totale;
+
 - durata attiva totale;
+
 - densità;
+
 - RIR medio;
+
 - RPE medio.
 
 La UI consente di visualizzare trend temporali per:
 
 - carico massimo;
+
 - volume;
+
 - TUT;
+
 - densità;
+
 - ripetizioni.
 
 È inoltre disponibile lo storico dettagliato di ogni serie/segmento registrato.
@@ -541,8 +923,11 @@ La UI consente di visualizzare trend temporali per:
 Legenda stato:
 
 - **UI** = disponibile nell'interfaccia Streamlit;
+
 - **BE** = implementata nel backend ma non esposta da una pagina dedicata;
+
 - **PARZIALE** = codice presente ma con gap tecnici indicati nella sezione finale;
+
 - **BACKLOG** = user story definita ma non ancora implementata nel codice corrente.
 
 ## Epic A - Gestione assistiti
@@ -554,8 +939,11 @@ Legenda stato:
 Criteri principali:
 
 - nome e cognome obbligatori;
+
 - data di nascita, altezza, peso, sesso, stile di vita e professione opzionali;
+
 - possibilità di inserire storia/anamnesi libera e patologie/note;
+
 - il peso iniziale può generare la prima rilevazione biometrica.
 
 ### US-PAT-02 - Ricerca assistiti `[UI]`
@@ -682,6 +1070,122 @@ Criteri principali:
 
 **Come sviluppatore/manutentore, voglio poter visualizzare e scaricare il log AG Grid → Python, così da diagnosticare problemi di sincronizzazione tra modifiche della griglia e stato server-side.**
 
+### US-DIET-17 - Budget alimentare settimanale indipendente dai giorni `[UI]`
+
+**Come nutrizionista, voglio definire gli alimenti e le relative quantità complessive della settimana senza assegnarli preventivamente a giorni specifici, così da costruire prima il fabbisogno alimentare complessivo e solo successivamente distribuirlo nella settimana.**
+
+Criteri principali:
+
+- deve essere disponibile una sezione Budget indipendente dalle grid dei singoli giorni;
+
+- per ogni alimento deve essere indicabile la quantità settimanale prevista in grammi;
+
+- devono essere calcolati i macro complessivi del Budget;
+
+- devono essere mostrate kcal, carboidrati, grassi e proteine medie giornaliere come totale settimanale / 7.
+
+### US-DIET-18 - Distribuzione libera del Budget nella settimana `[UI]`
+
+**Come nutrizionista, voglio distribuire liberamente gli alimenti definiti nel Budget nei diversi giorni e pasti della settimana, così da costruire il piano giornaliero mantenendo il riferimento alle quantità settimanali pianificate.**
+
+Criteri principali:
+
+- la Distribuzione resta organizzata per giorno, pasto, alimento e grammatura;
+
+- gli alimenti consolidati nel Budget devono essere utilizzabili nella Distribuzione;
+
+- la quantità assegnata deve essere ricavabile aggregando tutte le grammature dello stesso alimento presenti nei 7 giorni e 5 pasti.
+
+### US-DIET-19 - Riepilogo Budget con occorrenze, assegnati e residui `[UI]`
+
+**Come nutrizionista, voglio confrontare il Budget settimanale con quanto realmente distribuito nei giorni, così da capire immediatamente se ogni alimento è stato assegnato correttamente e con quale frequenza compare nel piano.**
+
+Criteri principali:
+
+- la prima colonna visibile del riepilogo deve essere **N. volte**;
+
+- N. volte deve contare quante righe della Distribuzione contengono l'alimento con grammatura > 0;
+
+- devono essere mostrati almeno Alimento, Budget, Assegnati e Residui;
+
+- il Residuo deve essere calcolato come `Budget - Assegnati`;
+
+- devono essere distinguibili i casi Assegnati < Budget, Assegnati = Budget, Assegnati > Budget e alimento fuori Budget.
+
+### US-DIET-20 - Aggiornamento esplicito del Budget alimentare `[UI]`
+
+**Come nutrizionista, voglio aggiornare esplicitamente i valori del Budget tramite un pulsante dedicato, così da evitare sincronizzazioni implicite e problemi tipici dei rerun di Streamlit.**
+
+Criteri principali:
+
+- deve essere disponibile il pulsante **Aggiorna i valori medi del Budget alimentare**;
+
+- il pulsante deve acquisire l'ultimo draft del Budget e ricalcolarne macro e medie;
+
+- deve leggere le grammature RAW della Distribuzione e aggiornare N. volte, Assegnati e Residui;
+
+- deve classificare le quantità assegnate come inferiori, uguali o superiori al Budget ed evidenziare gli alimenti fuori Budget;
+
+- non deve ricalcolare i macro della Distribuzione settimanale.
+
+### US-DIET-21 - Aggiornamento indipendente della Distribuzione settimanale `[UI]`
+
+**Come nutrizionista, voglio aggiornare i valori nutrizionali della Distribuzione settimanale indipendentemente dal Budget, così da poter lavorare sulle singole giornate senza attivare controlli di coerenza ad ogni modifica.**
+
+Criteri principali:
+
+- deve essere disponibile il pulsante **Aggiorna valori medi della Distribuzione settimanale**;
+
+- il pulsante deve ricalcolare macro per pasto, totali per giorno, totali settimanali e relative medie;
+
+- non deve effettuare controlli di coerenza con il Budget;
+
+- non deve modificare Budget, N. volte, Assegnati o Residui.
+
+### US-DIET-22 - Separazione dello stato tra Budget e Distribuzione `[UI]`
+
+**Come sistema, voglio mantenere separato lo stato del Budget dallo stato della Distribuzione settimanale, così da evitare sincronizzazioni implicite e inconsistenze durante i rerun di Streamlit.**
+
+Criteri principali:
+
+- devono essere mantenuti distinti draft Budget, Budget consolidato, grid giornaliere e aggregazioni della Distribuzione;
+
+- una modifica in una sezione non deve provocare automaticamente il ricalcolo dell'altra;
+
+- i valori derivati, come Residui, devono essere ricostruiti dai dati sorgente e non usati come source of truth autonoma.
+
+### US-DIET-23 - Controllo di coerenza bloccante prima del salvataggio `[UI]`
+
+**Come nutrizionista, voglio che il sistema verifichi la coerenza tra Budget e Distribuzione prima di aggiornare o creare un piano, così da evitare il salvataggio di una prescrizione incompleta o incoerente.**
+
+Criteri principali:
+
+- il controllo deve essere eseguito sia per **Aggiorna piano alimentare esistente** sia per **Salva come nuovo piano alimentare**;
+
+- il check deve leggere i dati RAW correnti e non dipendere da aggregazioni precedentemente memorizzate;
+
+- per ogni alimento deve valere `Budget = somma grammature assegnate`;
+
+- il salvataggio deve essere bloccato se Assegnati < Budget, Assegnati > Budget o esistono alimenti fuori Budget;
+
+- in caso di incoerenza deve essere mostrato un warning con il dettaglio degli alimenti coinvolti.
+
+### US-DIET-24 - Caricamento di un piano esistente con ricostruzione Budget `[UI]`
+
+**Come nutrizionista, voglio riaprire un piano alimentare esistente ricostruendo automaticamente Budget e Distribuzione, così da poterlo modificare mantenendo coerenti le quantità già assegnate.**
+
+Criteri principali:
+
+- le grid giorno/pasto devono essere inizializzate dagli item persistiti;
+
+- il Budget deve essere ricostruito aggregando le grammature salvate per alimento;
+
+- Assegnati deve essere inizializzato con le quantità già persistite;
+
+- N. volte deve essere ricostruito contando le occorrenze con grammatura > 0;
+
+- le modifiche successive devono rispettare i cicli separati di aggiornamento Budget e Distribuzione.
+
 ---
 
 ## Epic D - Workout
@@ -777,9 +1281,13 @@ Criteri principali:
 Criteri previsti:
 
 - una misurazione biometrica deve avere obbligatoriamente una dieta associata;
+
 - il workout associato è opzionale;
+
 - i riferimenti devono puntare a piani già esistenti dell'assistito;
+
 - lo storico deve continuare a essere leggibile anche se dieta o workout vengono successivamente archiviati/modificati;
+
 - l'implementazione richiederà un riallineamento del modello `biometrics` con foreign key esplicite verso `diet_plans` e `workout_plans`.
 
 > Questa user story è progettata ma **non ancora implementata** nella UI, nei service e nel DDL corrente.
@@ -791,34 +1299,59 @@ Criteri previsti:
 L'implementazione corrente adotta una separazione semplice tra UI, service e accesso dati.
 
 ```text
+
 ┌─────────────────────────────────────────────┐
-│                 Streamlit UI                │
-│ app.py + pages/*.py                         │
+
+│                 Streamlit UI                │
+
+│ app.py + pages/*.py                         │
+
 └──────────────────────┬──────────────────────┘
-                       │ chiamate Python
+
+                       │ chiamate Python
+
 ┌──────────────────────▼──────────────────────┐
-│               Service Layer                 │
-│ patient_service.py                          │
-│ biometrics_service.py                       │
-│ food_service.py                             │
-│ diet_service.py                             │
-│ workout_service.py                          │
+
+│               Service Layer                 │
+
+│ patient_service.py                          │
+
+│ biometrics_service.py                       │
+
+│ food_service.py                             │
+
+│ diet_service.py                             │
+
+│ workout_service.py                          │
+
 └──────────────────────┬──────────────────────┘
-                       │ psycopg2
+
+                       │ psycopg2
+
 ┌──────────────────────▼──────────────────────┐
-│                PostgreSQL                   │
+
+│                PostgreSQL                   │
+
 └─────────────────────────────────────────────┘
+
 ```
 
 Caratteristiche:
 
 - nessun ORM;
+
 - SQL esplicito nei service;
+
 - una nuova connessione DB per operazione tramite `Common.functions.connect()`;
+
 - transazioni esplicite nelle operazioni di scrittura;
+
 - `RealDictCursor` per esporre le righe come dizionari;
+
 - `st.session_state` usato per stato dell'utente, draft del piano e cache UI;
+
 - `st.cache_data` usato nel modulo diete per ridurre il caricamento ripetuto del catalogo alimenti;
+
 - AG Grid + JavaScript custom per l'editor alimentare.
 
 ---
@@ -826,51 +1359,97 @@ Caratteristiche:
 # Struttura del progetto
 
 ```text
+
 Nutriflow/
+
 │
+
 ├── app.py
-│   # Entry point Streamlit e inizializzazione stato globale
+
+│   # Entry point Streamlit e inizializzazione stato globale
+
 │
+
 ├── pages/
-│   ├── 1_pazienti.py
-│   ├── 2_biometria.py
-│   ├── 3_piani_alimentari.py
-│   ├── 4_workout.py
-│   └── 5_catalogo_alimenti.py
+
+│   ├── 1_pazienti.py
+
+│   ├── 2_biometria.py
+
+│   ├── 3_piani_alimentari.py
+
+│   ├── 4_workout.py
+
+│   └── 5_catalogo_alimenti.py
+
 │
+
 ├── Backend/
-│   ├── __init__.py
-│   ├── main.py                     # Attualmente vuoto
-│   │
-│   ├── services/
-│   │   ├── patient_service.py
-│   │   ├── biometrics_service.py
-│   │   ├── food_service.py
-│   │   ├── diet_service.py
-│   │   └── workout_service.py
-│   │
-│   ├── OneShot/
-│   │   └── scripts/
-│   │       ├── 00_test.sql
-│   │       ├── 01_ddl_schema.sql
-│   │       ├── 02_ddl_workout.sql
-│   │       ├── execute_scripts.py
-│   │       ├── insert_foods.py
-│   │       └── lista_alimenti.csv
-│   │
-│   └── Test/
-│       ├── test_patient_service.py
-│       └── test_biometrics_service.py
+
+│   ├── __init__.py
+
+│   ├── main.py                     # Attualmente vuoto
+
+│   │
+
+│   ├── services/
+
+│   │   ├── patient_service.py
+
+│   │   ├── biometrics_service.py
+
+│   │   ├── food_service.py
+
+│   │   ├── diet_service.py
+
+│   │   └── workout_service.py
+
+│   │
+
+│   ├── OneShot/
+
+│   │   └── scripts/
+
+│   │       ├── 00_test.sql
+
+│   │       ├── 01_ddl_schema.sql
+
+│   │       ├── 02_ddl_workout.sql
+
+│   │       ├── execute_scripts.py
+
+│   │       ├── insert_foods.py
+
+│   │       └── lista_alimenti.csv
+
+│   │
+
+│   └── Test/
+
+│       ├── test_patient_service.py
+
+│       └── test_biometrics_service.py
+
 │
+
 ├── Common/
-│   ├── configuration.py
-│   └── functions.py
+
+│   ├── configuration.py
+
+│   └── functions.py
+
 │
+
 ├── .devcontainer/
-│   └── devcontainer.json
+
+│   └── devcontainer.json
+
 │
+
 ├── requirements.txt
+
 └── README.md
+
 ```
 
 ---
@@ -880,40 +1459,67 @@ Nutriflow/
 ## Tabelle utilizzate
 
 | Tabella | Scopo |
+
 |---|---|
+
 | `users` | Identifica il professionista proprietario dei dati; autenticazione non ancora implementata in UI |
+
 | `patients` | Anagrafica, stile di vita, note cliniche e dati usati per il TDEE |
+
 | `biometrics` | Storico time-series di peso, circonferenze, pliche e BF% |
+
 | `food_categories` | Tipologica delle categorie alimentari |
+
 | `foods` | Catalogo alimenti con macro e micronutrienti per 100 g |
+
 | `anamnesis_questions` | Template delle domande di anamnesi |
+
 | `anamnesis_answers` | Risposte dell'assistito alle domande strutturate |
+
 | `diet_plans` | Testata del piano alimentare associato all'assistito |
+
 | `diet_meal_items` | Dettaglio del piano: giorno, pasto, alimento, grammi e macro calcolati |
+
 | `micronutrients_quantities` | Riferimenti usati per l'overview dei micronutrienti |
+
 | `workout_plans` | Testata del piano di allenamento associato all'assistito |
+
 | `workout_exercises` | Prescrizione degli esercizi, blocchi, tecniche e metriche di progressione |
+
 | `workout_measurements` | Storico delle performance per serie/segmento e seduta (`execution_id`) |
 
 ## Relazioni principali
 
 ```text
+
 users
- ├──< patients
- │     ├──< biometrics
- │     ├──< anamnesis_answers >── anamnesis_questions
- │     ├──< diet_plans
- │     │       └──< diet_meal_items >── foods
- │     └──< workout_plans
- │             └──< workout_exercises
- │                     └──< workout_measurements
- │
- └──< foods
+
+ ├──< patients
+
+ │     ├──< biometrics
+
+ │     ├──< anamnesis_answers >── anamnesis_questions
+
+ │     ├──< diet_plans
+
+ │     │       └──< diet_meal_items >── foods
+
+ │     └──< workout_plans
+
+ │             └──< workout_exercises
+
+ │                     └──< workout_measurements
+
+ │
+
+ └──< foods
 
 food_categories ──< foods
 
 micronutrients_quantities
-   └── collegamento logico/applicativo con le colonne micronutrienti di foods
+
+   └── collegamento logico/applicativo con le colonne micronutrienti di foods
+
 ```
 
 `diet_meal_items` mantiene anche una cache dei macro calcolati al momento del salvataggio del piano (`kcal_calculated`, `prot_calculated`, `carbs_calculated`, `fats_calculated`).
@@ -927,8 +1533,11 @@ micronutrients_quantities
 Per un alimento con valori nutrizionali espressi per 100 g:
 
 ```text
+
 ratio = grammi / 100
+
 nutriente_calcolato = nutriente_per_100g × ratio
+
 ```
 
 ## Micronutrienti
@@ -936,7 +1545,9 @@ nutriente_calcolato = nutriente_per_100g × ratio
 Il piano viene aggregato sull'intera settimana e normalizzato a media giornaliera:
 
 ```text
+
 apporto_medio_giornaliero = apporto_totale_settimana / 7
+
 ```
 
 Il confronto con la tipologica è effettuato solo se la `reference_basis` configurata è compatibile con la base del dato presente in `foods`.
@@ -946,7 +1557,9 @@ Il confronto con la tipologica è effettuato solo se la `reference_basis` config
 Per i riferimenti nutrizionali espressi per MJ:
 
 ```text
+
 MJ_giornalieri = kcal_giornaliere / 238.83
+
 ```
 
 ---
@@ -958,7 +1571,9 @@ Le metriche di progressione vengono derivate dai dati elementari presenti in `wo
 ### Volume
 
 ```text
+
 volume_kg = Σ(reps_completed × load_kg)
+
 ```
 
 Il volume non viene persistito come colonna dedicata, evitando ridondanza e possibili incoerenze rispetto ai dati di dettaglio.
@@ -966,13 +1581,17 @@ Il volume non viene persistito come colonna dedicata, evitando ridondanza e poss
 ### Carico massimo
 
 ```text
+
 peak_load_kg = MAX(load_kg)
+
 ```
 
 ### TUT totale
 
 ```text
+
 total_tut_seconds = Σ(tut_seconds)
+
 ```
 
 ### Densità
@@ -980,7 +1599,9 @@ total_tut_seconds = Σ(tut_seconds)
 La densità viene calcolata solo quando è disponibile una durata attiva maggiore di zero:
 
 ```text
+
 density_kg_per_minute = volume_kg / (total_duration_seconds / 60)
+
 ```
 
 Se `duration_seconds` non è valorizzato, la densità viene restituita come `NULL`.
@@ -988,8 +1609,11 @@ Se `duration_seconds` non è valorizzato, la densità viene restituita come `NUL
 ### RIR e RPE medi
 
 ```text
+
 avg_rir = AVG(rir)
+
 avg_rpe = AVG(rpe)
+
 ```
 
 Le metriche vengono calcolate a runtime dal backend e non duplicate nella tabella delle misurazioni.
@@ -1001,40 +1625,55 @@ Le metriche vengono calcolate a runtime dal backend e non duplicate nella tabell
 ## Prerequisiti
 
 - Python 3.11 consigliato;
+
 - PostgreSQL raggiungibile dall'ambiente di esecuzione;
+
 - variabile `DATABASE_URL` configurata.
 
 ## 1. Creare l'ambiente virtuale
 
 ```bash
+
 python -m venv .venv
+
 ```
 
 Attivazione Linux/macOS:
 
 ```bash
+
 source .venv/bin/activate
+
 ```
 
 Attivazione Windows PowerShell:
 
 ```powershell
+
 .venv\Scripts\Activate.ps1
+
 ```
 
 ## 2. Installare le dipendenze
 
 ```bash
+
 pip install -r requirements.txt
+
 ```
 
 Dipendenze principali:
 
 - `streamlit`;
+
 - `psycopg2-binary`;
+
 - `python-dotenv`;
+
 - `streamlit-aggrid`;
+
 - `reportlab`;
+
 - `pytest`.
 
 ## 3. Configurare il database
@@ -1042,7 +1681,9 @@ Dipendenze principali:
 Creare un file `.env` nella root:
 
 ```dotenv
+
 DATABASE_URL=postgresql://USER:PASSWORD@HOST:PORT/DB_NAME
+
 ```
 
 > **Attenzione:** lo script `Backend/OneShot/scripts/01_ddl_schema.sql` non è ancora completamente allineato ai service correnti. Per una nuova installazione è necessario applicare le correzioni/migrazioni indicate in [Known gaps e debito tecnico](#known-gaps-e-debito-tecnico) prima di usare il DDL come bootstrap definitivo.
@@ -1050,7 +1691,9 @@ DATABASE_URL=postgresql://USER:PASSWORD@HOST:PORT/DB_NAME
 Il modulo Workout dispone di un DDL dedicato:
 
 ```text
+
 Backend/OneShot/scripts/02_ddl_workout.sql
+
 ```
 
 Lo script crea `workout_plans`, `workout_exercises` e `workout_measurements` con relativi vincoli e indici. Deve essere applicato dopo lo schema base, perché contiene foreign key verso `users` e `patients`.
@@ -1060,7 +1703,9 @@ Lo script crea `workout_plans`, `workout_exercises` e `workout_measurements` con
 Dalla root del progetto:
 
 ```bash
+
 streamlit run app.py
+
 ```
 
 L'app utilizza la navigazione multipagina nativa di Streamlit e rileva automaticamente i file presenti in `pages/`.
@@ -1072,18 +1717,23 @@ L'app utilizza la navigazione multipagina nativa di Streamlit e rileva automatic
 La suite attuale contiene test unitari per:
 
 - `patient_service`;
+
 - `biometrics_service`.
 
 Esecuzione:
 
 ```bash
+
 pytest Backend/Test -v
+
 ```
 
 oppure:
 
 ```bash
+
 PYTHONPATH=. pytest Backend/Test -v
+
 ```
 
 La copertura non include ancora `diet_service`, `food_service`, `workout_service` e i flussi UI Streamlit/AG Grid.
@@ -1099,7 +1749,9 @@ Questa sezione documenta incongruenze rilevate confrontando UI, service e DDL. N
 In `01_ddl_schema.sql` manca una virgola dopo:
 
 ```sql
+
 diet_plan_id UUID REFERENCES diet_plans(id) ON DELETE SET NULL
+
 ```
 
 prima della colonna `food_id`.
@@ -1111,8 +1763,11 @@ Il DDL, così com'è, non può essere eseguito integralmente su un database nuov
 `patient_service.py` legge e aggiorna:
 
 ```text
+
 tdee_kcal
+
 tdee_updated_at
+
 ```
 
 ma queste colonne non sono presenti nella definizione corrente di `patients` in `01_ddl_schema.sql`.
@@ -1122,10 +1777,15 @@ ma queste colonne non sono presenti nella definizione corrente di `patients` in 
 `diet_service.py` legge da `micronutrients_quantities` anche:
 
 ```text
+
 reference_type
+
 maximum_type
+
 reference_basis
+
 reference_source
+
 ```
 
 ma il DDL corrente non definisce tali colonne.
@@ -1135,19 +1795,29 @@ ma il DDL corrente non definisce tali colonne.
 La UI della biometria invia alcuni campi con naming singolare/abbreviato, ad esempio:
 
 ```text
+
 circ_polso_cm
+
 circ_braccio_cm
+
 circ_avambracco_cm
+
 circ_polpaccio_cm
+
 ```
 
 mentre il DDL definisce:
 
 ```text
+
 circ_polsi_cm
+
 circ_braccia_cm
+
 circ_avambracci_cm
+
 circ_polpacci_cm
+
 ```
 
 Questo va normalizzato per evitare errori nelle INSERT su un DB costruito dal DDL corrente.
@@ -1169,13 +1839,17 @@ Il dettaglio tabellare funziona, ma i grafici di trend devono essere riallineati
 La configurazione contiene ancora riferimenti a:
 
 ```text
+
 Frontend/app.py
+
 ```
 
 mentre l'entry point reale è:
 
 ```text
+
 app.py
+
 ```
 
 Vanno aggiornati almeno `openFiles` e `postAttachCommand`.
@@ -1185,13 +1859,17 @@ Vanno aggiornati almeno `openFiles` e `postAttachCommand`.
 `insert_foods.py` utilizza:
 
 ```python
+
 CSV_FILE = "ppj/Nutriflow/DB/scripts/lista_alimenti.csv"
+
 ```
 
 ma il CSV è presente nel repository in:
 
 ```text
+
 Backend/OneShot/scripts/lista_alimenti.csv
+
 ```
 
 Il path dovrebbe essere costruito a partire da `Path(__file__).resolve().parent`.
@@ -1207,7 +1885,9 @@ Su PostgreSQL è opportuno rendere il commit esplicito dopo l'esecuzione corrett
 Le pagine impostano, in assenza di sessione autenticata:
 
 ```text
+
 00000000-0000-0000-0000-000000000000
+
 ```
 
 come `user_id`.
@@ -1219,7 +1899,9 @@ Poiché `patients.user_id` è una foreign key verso `users.id`, sul DB deve esis
 Il vecchio README descriveva ricette e tabelle `recipes` / `recipe_ingredients`, ma nel codice corrente:
 
 - non esiste un `recipe_service`;
+
 - non esiste una pagina ricette;
+
 - il DDL effettua solo il `DROP` delle vecchie tabelle, senza ricrearle.
 
 La capability non va quindi considerata implementata.
@@ -1231,11 +1913,17 @@ La capability non va quindi considerata implementata.
 Il service `workout_service.py` e la pagina `4_workout.py` sono implementati, ma non esiste ancora una suite automatica dedicata a:
 
 - CRUD dei workout;
+
 - aggiornamento con conservazione degli UUID degli esercizi;
+
 - archiviazione/ripristino;
+
 - gestione dei blocchi;
+
 - validazione delle tecniche;
+
 - inserimento di serie/segmenti;
+
 - aggregazione di volume, TUT e densità.
 
 ## 13. Biometria non ancora correlata a dieta e workout
@@ -1244,31 +1932,58 @@ La user story che prevede una dieta obbligatoria e un workout opzionale per ogni
 
 Il modello corrente non contiene ancora foreign key esplicite da `biometrics` verso `diet_plans` e `workout_plans`; la modifica dovrà inoltre preservare la leggibilità storica delle associazioni.
 
+## 14. Budget settimanale non persistito separatamente
+
+Il Budget alimentare settimanale è attualmente uno stato di lavoro gestito nell'editor Streamlit e non dispone di una tabella/entità DB dedicata.
+
+Quando viene riaperto un piano esistente, il Budget viene quindi ricostruito a partire da `diet_meal_items` aggregando le grammature realmente salvate. Di conseguenza, un eventuale target teorico non completamente allocato non può essere recuperato dopo la chiusura della sessione.
+
+Se sarà necessario conservare anche il Budget originario come informazione indipendente dalla Distribuzione, il modello dati dovrà essere esteso con una persistenza dedicata del target settimanale per alimento.
+
+---
+
 ## Evoluzioni consigliate
 
 Le priorità tecniche più immediate sono:
 
 1. riallineare DDL e codice con una migration versionata;
+
 2. implementare l'associazione `biometrics → diet_plan` obbligatoria e `biometrics → workout_plan` opzionale;
+
 3. correggere naming e trend del modulo biometrico;
+
 4. rimuovere il `user_id` placeholder introducendo un'identità applicativa coerente;
+
 5. aggiornare devcontainer e script di bootstrap;
+
 6. aggiungere test per `diet_service`, micronutrienti e `workout_service`;
+
 7. estendere, se necessario, la UI del catalogo alla manutenzione delle categorie e dei riferimenti micronutrienti;
+
 8. introdurre post-MVP la separazione/ownership del catalogo alimenti per nutrizionista;
+
 9. collegare alla UI il questionario di anamnesi strutturato già supportato dal backend.
+
+10. valutare una persistenza DB dedicata del Budget settimanale quando sarà necessario conservare target non ancora completamente allocati dopo la chiusura della sessione.
 
 ---
 
 ## Stack tecnologico
 
 - **Python**
+
 - **Streamlit**
+
 - **streamlit-aggrid / AG Grid**
+
 - **PostgreSQL**
+
 - **psycopg2**
+
 - **Pandas**
+
 - **ReportLab**
+
 - **PyTest**
 
 ---
