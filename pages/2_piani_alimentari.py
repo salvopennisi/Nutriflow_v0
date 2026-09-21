@@ -5,6 +5,7 @@ from datetime import datetime
 from io import BytesIO
 import html
 import re
+import uuid
 import streamlit as st
 import json
 import pandas as pd
@@ -17,12 +18,13 @@ except ImportError:
 from Backend.services.patient_service import get_all_patients
 from Backend.services.diet_service import (
     get_diet_plans,
-    add_diet_plan,
-    update_diet_plan,
     delete_diet_plan,
     diet_name_exists,
     calculate_nutrients_proportional,
     calculate_diet_micronutrients_overview,
+    get_recipes_for_diet,
+    add_diet_plan_with_recipes,
+    update_diet_plan_with_recipes,
 )
 from Backend.services.food_service import get_foods_for_diet_editor
 
@@ -206,6 +208,73 @@ def _pdf_number(value) -> float:
 def _pdf_text(value) -> str:
     """Testo sicuro per i Paragraph ReportLab."""
     return html.escape(str(value if value not in (None, "") else "N/D"))
+
+
+def _saved_recipe_map(diet: dict) -> dict:
+    """Mappa recipe_id -> recipe usando il payload restituito dal service layer."""
+    result = {}
+    for recipe in (diet or {}).get("recipes", []) or []:
+        recipe_id = recipe.get("id") or recipe.get("recipe_id")
+        if recipe_id:
+            result[str(recipe_id)] = recipe
+    return result
+
+
+def _saved_item_display_name(diet: dict, item: dict) -> str:
+    recipe_id = item.get("recipe_id")
+    if recipe_id:
+        recipe = _saved_recipe_map(diet).get(str(recipe_id), {})
+        return str(recipe.get("name") or item.get("recipe_name") or "Ricetta").strip()
+    return str(item.get("item_name") or item.get("food_name") or "N/D").strip()
+
+
+def _saved_item_food_components(diet: dict, item: dict) -> list:
+    """Espande una riga salvata in alimenti reali, utile per spesa e micronutrienti."""
+    grams = _pdf_number(item.get("grams"))
+    if grams <= 0:
+        return []
+
+    recipe_id = item.get("recipe_id")
+    if not recipe_id:
+        food_name = str(item.get("food_name") or item.get("item_name") or "").strip()
+        if not food_name:
+            return []
+        return [{
+            "food_id": item.get("food_id"),
+            "food_name": food_name,
+            "grams": grams,
+        }]
+
+    recipe = _saved_recipe_map(diet).get(str(recipe_id))
+    if not recipe:
+        return []
+    ingredients = list(recipe.get("ingredients") or [])
+    recipe_total = sum(_pdf_number(x.get("grams")) for x in ingredients)
+    if recipe_total <= 0:
+        return []
+
+    factor = grams / recipe_total
+    expanded = []
+    for ingredient in ingredients:
+        nested_food = ingredient.get("food") or ingredient.get("foods") or {}
+        if not isinstance(nested_food, dict):
+            nested_food = {}
+        food_name = str(
+            ingredient.get("food_name")
+            or ingredient.get("item_name")
+            or nested_food.get("item_name")
+            or nested_food.get("name")
+            or ""
+        ).strip()
+        food_id = ingredient.get("food_id") or nested_food.get("id")
+        ingredient_grams = _pdf_number(ingredient.get("grams")) * factor
+        if food_name and ingredient_grams > 0:
+            expanded.append({
+                "food_id": food_id,
+                "food_name": food_name,
+                "grams": ingredient_grams,
+            })
+    return expanded
 
 
 def _micronutrient_overview_dataframe(result: dict) -> pd.DataFrame:
@@ -422,11 +491,12 @@ def _build_diet_pdf(diet: dict, patient_name: str) -> bytes:
             daily_totals[day_code]["fats"] += _pdf_number(item.get("fats_calculated"))
             daily_totals[day_code]["prot"] += _pdf_number(item.get("prot_calculated"))
 
-        item_name = str(item.get("item_name") or item.get("food_name") or "N/D").strip()
-        normalized_name = item_name.casefold()
-        if normalized_name not in shopping:
-            shopping[normalized_name] = {"label": item_name, "grams": 0.0}
-        shopping[normalized_name]["grams"] += _pdf_number(item.get("grams"))
+        for component in _saved_item_food_components(diet, item):
+            item_name = str(component.get("food_name") or "N/D").strip()
+            normalized_name = item_name.casefold()
+            if normalized_name not in shopping:
+                shopping[normalized_name] = {"label": item_name, "grams": 0.0}
+            shopping[normalized_name]["grams"] += _pdf_number(component.get("grams"))
 
     buffer = BytesIO()
     doc = SimpleDocTemplate(
@@ -651,7 +721,7 @@ def _build_diet_pdf(diet: dict, patient_name: str) -> bytes:
             for item in day_items:
                 detail_data.append([
                     Paragraph(_pdf_text(item.get("meal_type")), small_style),
-                    Paragraph(_pdf_text(item.get("item_name") or item.get("food_name")), small_style),
+                    Paragraph(_pdf_text(_saved_item_display_name(diet, item)), small_style),
                     f"{_pdf_number(item.get('grams')):.1f}",
                     f"{_pdf_number(item.get('kcal_calculated')):.1f}",
                     f"{_pdf_number(item.get('carbs_calculated')):.1f}",
@@ -721,6 +791,8 @@ def _clear_editor_state_if_deleted(diet_id):
             or key_str.startswith("ag_diet_weekly_budget")
             or key_str.startswith("diet_distribution_")
             or key_str.startswith("ag_diet_distribution")
+            or key_str.startswith("diet_preparation")
+            or key_str.startswith("diet_recipes")
         ):
             st.session_state.pop(key, None)
 
@@ -799,6 +871,18 @@ with tab_list:
     # Esempio di utilizzo dei servizi BE analogamente al modulo biometria che mi hai inviato
     try:
         patient_diets = get_diet_plans(tec_conf, current_patient_id)
+        # Arricchisce i piani con le ricette persistite, necessarie per visualizzare
+        # correttamente le righe diet_meal_items che hanno recipe_id valorizzato.
+        for _diet in patient_diets or []:
+            try:
+                _diet["recipes"] = get_recipes_for_diet(tec_conf, _diet.get("id"))
+            except Exception as _recipe_exc:
+                logger.warning(
+                    "Impossibile caricare le ricette del piano %s: %s",
+                    _diet.get("id"), _recipe_exc
+                )
+                _diet.setdefault("recipes", [])
+
         if patient_diets:
             tot = len(patient_diets)
             st.info(f" Sono stati trovati {tot} piani alimentari per questo assistito")
@@ -838,9 +922,12 @@ with tab_list:
                         use_container_width=True,
                     ):
                         try:
+                            micro_items = []
+                            for saved_item in diet.get("items", []):
+                                micro_items.extend(_saved_item_food_components(diet, saved_item))
                             st.session_state[micro_state_key] = calculate_diet_micronutrients_overview(
                                 tec_conf,
-                                diet.get("items", []),
+                                micro_items,
                                 days_in_plan=7,
                             )
                         except Exception as exc:
@@ -906,11 +993,12 @@ with tab_list:
                     shopping_items = {}
                     # Usiamo la stessa affidabile logica presente nel generatore PDF
                     for item in diet.get("items", []):
-                        item_name = str(item.get("item_name") or item.get("food_name") or "N/D").strip()
-                        norm_name = item_name.casefold()
-                        if norm_name not in shopping_items:
-                            shopping_items[norm_name] = {"Alimento": item_name, "Quantità totale (g)": 0.0}
-                        shopping_items[norm_name]["Quantità totale (g)"] += _pdf_number(item.get("grams"))
+                        for component in _saved_item_food_components(diet, item):
+                            item_name = str(component.get("food_name") or "N/D").strip()
+                            norm_name = item_name.casefold()
+                            if norm_name not in shopping_items:
+                                shopping_items[norm_name] = {"Alimento": item_name, "Quantità totale (g)": 0.0}
+                            shopping_items[norm_name]["Quantità totale (g)"] += _pdf_number(component.get("grams"))
                     
                     if shopping_items:
                         df_shopping = pd.DataFrame(list(shopping_items.values()))
@@ -957,7 +1045,7 @@ with tab_list:
                         formatted_items.append({
                             "Giorno": GIORNI_MAP.get(item['giorno_settimana'], "N/D"),
                             "Pasto": item['meal_type'],
-                            "Item": item['food_name'],
+                            "Item": _saved_item_display_name(diet, item),
                             "Grammi (g)": item['grams'],
                             "Kcal": item['kcal_calculated'],
                             "Carbs (g)": item['carbs_calculated'],
@@ -1153,6 +1241,266 @@ def _food_name_key(value):
 
 
 # ------------------------------------------------------------------
+# RICETTE / PASTI COMPOSTI - persistenti su recipes + recipe_ingredients
+# ------------------------------------------------------------------
+RECIPES_KEY = "diet_recipes_v2"
+RECIPE_PREFIX = "🍳 "
+
+
+def _recipe_label(name):
+    name = str(name or "").strip()
+    return f"{RECIPE_PREFIX}{name}" if name else ""
+
+
+def _recipe_name_from_label(value):
+    value = str(value or "").strip()
+    if value.startswith(RECIPE_PREFIX):
+        return value[len(RECIPE_PREFIX):].strip()
+    return None
+
+
+def _recipe_client_key(recipe):
+    """Chiave stabile client-side usata dal service per mappare recipe create prima del diet_plan."""
+    if not isinstance(recipe, dict):
+        return None
+    value = recipe.get("client_key") or recipe.get("id")
+    return str(value) if value else None
+
+
+def _normalize_recipe(recipe):
+    if not isinstance(recipe, dict):
+        return None
+    name = str(recipe.get("name") or "").strip()
+    if not name:
+        return None
+
+    recipe_id = recipe.get("id") or recipe.get("recipe_id")
+    client_key = recipe.get("client_key") or recipe_id or str(uuid.uuid4())
+    ingredients = []
+    for item in recipe.get("ingredients", []) or []:
+        if not isinstance(item, dict):
+            continue
+        nested_food = item.get("food") or item.get("foods") or {}
+        if not isinstance(nested_food, dict):
+            nested_food = {}
+        food_id = item.get("food_id") or nested_food.get("id")
+        food_name = str(
+            item.get("food_name")
+            or item.get("item_name")
+            or nested_food.get("item_name")
+            or nested_food.get("name")
+            or ""
+        ).strip()
+        grams = _safe_float(item.get("grams"))
+        if food_id and food_name and grams > 0:
+            ingredients.append({
+                "food_id": str(food_id),
+                "food_name": food_name,
+                "grams": grams,
+            })
+    if not ingredients:
+        return None
+
+    return {
+        "id": str(recipe_id) if recipe_id else None,
+        "client_key": str(client_key),
+        "name": name,
+        "portions": max(1, int(recipe.get("portions") or 1)),
+        "ingredients": ingredients,
+    }
+
+
+def _set_recipes(recipes):
+    normalized = {}
+    for recipe in recipes or []:
+        item = _normalize_recipe(recipe)
+        if item is not None:
+            normalized[item["name"]] = item
+    st.session_state[RECIPES_KEY] = normalized
+    return normalized
+
+
+def _get_recipes():
+    """Ricette correnti dell'editor, indicizzate per nome e comprensive degli ID DB."""
+    raw = st.session_state.get(RECIPES_KEY, {}) or {}
+    if not isinstance(raw, dict):
+        return {}
+    result = {}
+    for _, recipe in raw.items():
+        item = _normalize_recipe(recipe)
+        if item is not None:
+            result[item["name"]] = item
+    return result
+
+
+def _recipe_by_id(recipe_id):
+    if not recipe_id:
+        return None
+    target = str(recipe_id)
+    for recipe in _get_recipes().values():
+        if recipe.get("id") and str(recipe.get("id")) == target:
+            return recipe
+    return None
+
+
+def _recipe_by_client_key(client_key):
+    if not client_key:
+        return None
+    target = str(client_key)
+    for recipe in _get_recipes().values():
+        if str(recipe.get("client_key")) == target:
+            return recipe
+    return None
+
+
+def _recipe_total_grams(recipe):
+    return sum(_safe_float(i.get("grams")) for i in (recipe or {}).get("ingredients", []))
+
+
+def _recipe_profile(recipe, food_js_db):
+    """Profilo nutrizionale per 100 g della ricetta, calcolato dagli ingredienti reali."""
+    total_grams = _recipe_total_grams(recipe)
+    totals = _zero_totals()
+    if total_grams <= 0:
+        return None
+
+    for ingredient in recipe.get("ingredients", []):
+        food_name = str(ingredient.get("food_name") or "").strip()
+        grams = _safe_float(ingredient.get("grams"))
+        nutrition = food_js_db.get(food_name)
+        if not nutrition or grams <= 0:
+            continue
+        ratio = grams / 100.0
+        totals["kcal"] += _safe_float(nutrition.get("kcal")) * ratio
+        totals["carbs"] += _safe_float(nutrition.get("carbs")) * ratio
+        totals["fats"] += _safe_float(nutrition.get("fats")) * ratio
+        totals["prot"] += _safe_float(nutrition.get("prot")) * ratio
+
+    return {
+        "kcal": round(totals["kcal"] * 100.0 / total_grams, 4),
+        "carbs": round(totals["carbs"] * 100.0 / total_grams, 4),
+        "fats": round(totals["fats"] * 100.0 / total_grams, 4),
+        "prot": round(totals["prot"] * 100.0 / total_grams, 4),
+    }
+
+
+def _recipe_food_db(food_js_db):
+    """Catalogo virtuale per AG Grid: le ricette sono trattate come alimenti solo a fini visuali."""
+    result = {}
+    for name, recipe in _get_recipes().items():
+        profile = _recipe_profile(recipe, food_js_db)
+        if profile is not None:
+            result[_recipe_label(name)] = profile
+    return result
+
+
+def _expand_distribution_choice(choice, grams):
+    """Espande una riga della Distribuzione negli ingredienti reali, per Budget/coerenza."""
+    choice = str(choice or "").strip()
+    grams = _safe_float(grams)
+    if not choice or grams <= 0:
+        return []
+
+    recipe_name = _recipe_name_from_label(choice)
+    if recipe_name is None:
+        return [{"food_name": choice, "grams": grams, "source": "food"}]
+
+    recipe = _get_recipes().get(recipe_name)
+    if not recipe:
+        return []
+
+    total_grams = _recipe_total_grams(recipe)
+    if total_grams <= 0:
+        return []
+
+    factor = grams / total_grams
+    expanded = []
+    for ingredient in recipe.get("ingredients", []):
+        food_name = str(ingredient.get("food_name") or "").strip()
+        ingredient_grams = _safe_float(ingredient.get("grams")) * factor
+        if food_name and ingredient_grams > 0:
+            expanded.append({
+                "food_id": ingredient.get("food_id"),
+                "food_name": food_name,
+                "grams": ingredient_grams,
+                "source": "recipe",
+                "recipe_id": recipe.get("id"),
+                "recipe_client_key": recipe.get("client_key"),
+                "recipe_name": recipe_name,
+            })
+    return expanded
+
+
+def _diet_item_display_choice(item):
+    """Nome mostrato nella Distribuzione per un meal item DB alimento/ricetta."""
+    recipe_id = item.get("recipe_id")
+    if recipe_id:
+        recipe = _recipe_by_id(recipe_id)
+        recipe_name = (
+            (recipe or {}).get("name")
+            or item.get("recipe_name")
+            or item.get("name")
+        )
+        return _recipe_label(recipe_name) if recipe_name else ""
+    return str(item.get("food_name") or item.get("item_name") or "").strip()
+
+
+def _expand_persisted_diet_item(item):
+    """Espande un meal item già persistito per ricostruire Budget/Assegnati."""
+    grams = _safe_float(item.get("grams"))
+    if grams <= 0:
+        return []
+    choice = _diet_item_display_choice(item)
+    return _expand_distribution_choice(choice, grams)
+
+
+def _recipe_is_used(recipe_name):
+    target = _food_name_key(_recipe_label(recipe_name))
+    raw = st.session_state.get(DISTRIBUTION_GRID_KEY)
+    if raw is None:
+        return False
+    df = _normalize_distribution_df(raw)
+    return any(_food_name_key(v) == target for v in df["Alimento"].fillna("").astype(str))
+
+
+def _rename_recipe_in_distribution(old_name, new_name):
+    raw = st.session_state.get(DISTRIBUTION_GRID_KEY)
+    if raw is None:
+        return
+    df = _normalize_distribution_df(raw)
+    old_label = _recipe_label(old_name)
+    new_label = _recipe_label(new_name)
+    mask = df["Alimento"].fillna("").astype(str).map(_food_name_key) == _food_name_key(old_label)
+    if mask.any():
+        df.loc[mask, "Alimento"] = new_label
+        st.session_state[DISTRIBUTION_GRID_KEY] = _normalize_distribution_df(df)
+        st.session_state[DISTRIBUTION_SIG_KEY] = _distribution_signature(df)
+        st.session_state["diet_aggregations_dirty"] = True
+        st.session_state["diet_budget_comparison_stale"] = True
+
+
+def _recipes_payload_for_persistence():
+    """Payload del service: recipe + ingredients. client_key mappa le ricette nuove ai meal item."""
+    payload = []
+    for recipe in _get_recipes().values():
+        payload.append({
+            "id": recipe.get("id"),
+            "client_key": recipe.get("client_key"),
+            "name": recipe.get("name"),
+            "portions": int(recipe.get("portions") or 1),
+            "ingredients": [
+                {
+                    "food_id": item.get("food_id"),
+                    "food_name": item.get("food_name"),
+                    "grams": round(_safe_float(item.get("grams")), 2),
+                }
+                for item in recipe.get("ingredients", [])
+                if item.get("food_id") and _safe_float(item.get("grams")) > 0
+            ],
+        })
+    return payload
+
+# ------------------------------------------------------------------
 # DISTRIBUZIONE SETTIMANALE CANONICA - singola grid filtrabile
 # ------------------------------------------------------------------
 DISTRIBUTION_GRID_KEY = "diet_distribution_grid_v1"
@@ -1230,13 +1578,13 @@ def _resolve_distribution_day_label(value):
 
 
 def _distribution_df_from_diet_items(items):
-    """Ricostruisce il master canonico direttamente dagli item persistiti del piano."""
+    """Ricostruisce la Distribuzione preservando le righe recipe_id come ricette."""
     rows = []
     for idx, item in enumerate(items or []):
         day_label = _resolve_distribution_day_label(item.get("giorno_settimana"))
         meal_label = str(item.get("meal_type") or "").strip()
-        food_name = str(item.get("food_name") or item.get("item_name") or "").strip()
-        if not day_label or not meal_label or not food_name:
+        display_choice = _diet_item_display_choice(item)
+        if not day_label or not meal_label or not display_choice:
             continue
         rows.append({
             "option": "",
@@ -1245,7 +1593,7 @@ def _distribution_df_from_diet_items(items):
             "__deleted": 0,
             "Giorno": day_label,
             "Pasto": meal_label,
-            "Alimento": food_name,
+            "Alimento": display_choice,
             "Grammi (g)": _safe_float(item.get("grams")),
         })
 
@@ -1286,44 +1634,50 @@ def _distribution_basic_valid_rows(data):
 
 
 def _distribution_aggregate_grams(data=None):
+    """Somma le grammature reali consumate, espandendo le preparazioni nei loro ingredienti."""
     raw_df = data if data is not None else st.session_state.get(DISTRIBUTION_GRID_KEY)
     if raw_df is None:
         return {}
     df = _normalize_distribution_df(raw_df)
     by_key = {}
-    for food_name, grams in df[["Alimento", "Grammi (g)"]].itertuples(index=False, name=None):
-        name = "" if pd.isna(food_name) else str(food_name).strip()
-        grams_value = _safe_float(grams)
-        if not name or grams_value <= 0:
-            continue
-        key = _food_name_key(name)
-        if not key:
-            continue
-        entry = by_key.setdefault(key, {"label": name, "grams": 0.0})
-        entry["grams"] += grams_value
+    for choice, grams in df[["Alimento", "Grammi (g)"]].itertuples(index=False, name=None):
+        for item in _expand_distribution_choice(choice, grams):
+            name = str(item.get("food_name") or "").strip()
+            grams_value = _safe_float(item.get("grams"))
+            key = _food_name_key(name)
+            if not key or grams_value <= 0:
+                continue
+            entry = by_key.setdefault(key, {"label": name, "grams": 0.0})
+            entry["grams"] += grams_value
     return {entry["label"]: entry["grams"] for entry in by_key.values()}
 
 
 def _distribution_occurrences(data=None):
+    """Conta le presenze per alimento reale; una ricetta vale una presenza per ingrediente."""
     raw_df = data if data is not None else st.session_state.get(DISTRIBUTION_GRID_KEY)
     if raw_df is None:
         return {}
     df = _normalize_distribution_df(raw_df)
     by_key = {}
-    for food_name, grams in df[["Alimento", "Grammi (g)"]].itertuples(index=False, name=None):
-        name = "" if pd.isna(food_name) else str(food_name).strip()
-        if not name or _safe_float(grams) <= 0:
-            continue
-        key = _food_name_key(name)
-        if not key:
-            continue
-        entry = by_key.setdefault(key, {"label": name, "count": 0})
-        entry["count"] += 1
+    for choice, grams in df[["Alimento", "Grammi (g)"]].itertuples(index=False, name=None):
+        row_foods = {}
+        for item in _expand_distribution_choice(choice, grams):
+            name = str(item.get("food_name") or "").strip()
+            key = _food_name_key(name)
+            if key:
+                row_foods.setdefault(key, name)
+        for key, name in row_foods.items():
+            entry = by_key.setdefault(key, {"label": name, "count": 0})
+            entry["count"] += 1
     return {entry["label"]: int(entry["count"]) for entry in by_key.values()}
 
 
 def _process_distribution(data, food_dict, food_js_db, days, meals):
-    """Converte il master DataFrame in item persistibili e aggregazioni nutrizionali."""
+    """Converte la grid in meal item persistibili preservando food_id XOR recipe_id.
+
+    Le ricette NON vengono esplose in diet_meal_items: l'espansione avviene solo per
+    Budget/coerenza. I macro della riga ricetta sono calcolati dal profilo della ricetta.
+    """
     df = _normalize_distribution_df(data)
     day_code_map = {label: code for code, label in GIORNI_MAP.items()}
     allowed_days = set(days)
@@ -1332,39 +1686,68 @@ def _process_distribution(data, food_dict, food_js_db, days, meals):
     weekly = _zero_totals()
     daily = {day: _zero_totals() for day in days}
 
-    for day, meal, food_name, grams in df[["Giorno", "Pasto", "Alimento", "Grammi (g)"]].itertuples(index=False, name=None):
+    for day, meal, choice, grams in df[["Giorno", "Pasto", "Alimento", "Grammi (g)"]].itertuples(index=False, name=None):
         day = "" if pd.isna(day) else str(day).strip()
         meal = "" if pd.isna(meal) else str(meal).strip()
-        name = "" if pd.isna(food_name) else str(food_name).strip()
+        choice = "" if pd.isna(choice) else str(choice).strip()
         grams_value = _safe_float(grams)
-        if (
-            day not in allowed_days
-            or meal not in allowed_meals
-            or not name
-            or grams_value <= 0
-            or name not in food_dict
-            or name not in food_js_db
-        ):
+        if day not in allowed_days or meal not in allowed_meals or not choice or grams_value <= 0:
             continue
 
-        nutrition = food_js_db[name]
-        ratio = grams_value / 100.0
-        kcal = round(nutrition["kcal"] * ratio, 1)
-        carbs = round(nutrition["carbs"] * ratio, 1)
-        fats = round(nutrition["fats"] * ratio, 1)
-        prot = round(nutrition["prot"] * ratio, 1)
-        item = {
-            "giorno_settimana": day_code_map[day],
-            "giorno_label": day,
-            "meal_type": meal,
-            "food_id": food_dict[name]["id"],
-            "food_name": name,
-            "grams": grams_value,
-            "kcal": kcal,
-            "carbs": carbs,
-            "fats": fats,
-            "prot": prot,
-        }
+        recipe_name = _recipe_name_from_label(choice)
+        if recipe_name is None:
+            if choice not in food_dict or choice not in food_js_db:
+                continue
+            nutrition = food_js_db[choice]
+            ratio = grams_value / 100.0
+            kcal = round(_safe_float(nutrition.get("kcal")) * ratio, 1)
+            carbs = round(_safe_float(nutrition.get("carbs")) * ratio, 1)
+            fats = round(_safe_float(nutrition.get("fats")) * ratio, 1)
+            prot = round(_safe_float(nutrition.get("prot")) * ratio, 1)
+            item = {
+                "source_type": "food",
+                "giorno_settimana": day_code_map[day],
+                "giorno_label": day,
+                "meal_type": meal,
+                "food_id": food_dict[choice]["id"],
+                "food_name": choice,
+                "recipe_id": None,
+                "recipe_ref": None,
+                "grams": round(grams_value, 2),
+                "kcal": kcal,
+                "carbs": carbs,
+                "fats": fats,
+                "prot": prot,
+            }
+        else:
+            recipe = _get_recipes().get(recipe_name)
+            profile = _recipe_profile(recipe, food_js_db) if recipe else None
+            if not recipe or profile is None:
+                continue
+            ratio = grams_value / 100.0
+            kcal = round(_safe_float(profile.get("kcal")) * ratio, 1)
+            carbs = round(_safe_float(profile.get("carbs")) * ratio, 1)
+            fats = round(_safe_float(profile.get("fats")) * ratio, 1)
+            prot = round(_safe_float(profile.get("prot")) * ratio, 1)
+            item = {
+                "source_type": "recipe",
+                "giorno_settimana": day_code_map[day],
+                "giorno_label": day,
+                "meal_type": meal,
+                "food_id": None,
+                "food_name": None,
+                # Per una ricetta gia persistita l'ID puo essere usato direttamente.
+                # Per una nuova ricetta il service risolve recipe_ref dopo l'INSERT recipes.
+                "recipe_id": recipe.get("id"),
+                "recipe_ref": recipe.get("client_key"),
+                "recipe_name": recipe.get("name"),
+                "grams": round(grams_value, 2),
+                "kcal": kcal,
+                "carbs": carbs,
+                "fats": fats,
+                "prot": prot,
+            }
+
         items.append(item)
         for key, value in (("kcal", kcal), ("carbs", carbs), ("fats", fats), ("prot", prot)):
             weekly[key] += value
@@ -1374,6 +1757,7 @@ def _process_distribution(data, food_dict, food_js_db, days, meals):
 
 
 def _recalculate_distribution(food_dict, food_js_db, days, meals, trigger="unknown"):
+
     """Consolida SOLO la Distribuzione; non legge e non aggiorna il Budget."""
     raw_df = st.session_state.get(DISTRIBUTION_GRID_KEY, _empty_distribution_df())
     normalized = _normalize_distribution_df(raw_df)
@@ -1951,6 +2335,8 @@ def _reset_diet_editor_state(clear_search=True):
             or key_str.startswith("ag_diet_weekly_budget")
             or key_str.startswith("diet_distribution_")
             or key_str.startswith("ag_diet_distribution")
+            or key_str.startswith("diet_preparation")
+            or key_str.startswith("diet_recipes")
         ):
             del st.session_state[key]
 
@@ -2000,6 +2386,17 @@ def _load_diet_into_editor(diet):
     st.session_state["diet_loaded_plan_id"] = diet.get("id")
     st.session_state["diet_loaded_plan_name"] = diet.get("diet_name") or ""
 
+    # Carica dal DB le ricette persistite prima di ricostruire Budget e Distribuzione.
+    persisted_recipes = diet.get("recipes")
+    if persisted_recipes is None:
+        try:
+            persisted_recipes = get_recipes_for_diet(tec_conf, diet.get("id"))
+        except Exception as exc:
+            logger.error("Errore nel caricamento delle ricette del piano", exc_info=True)
+            st.warning(f"Impossibile caricare le ricette del piano: {exc}")
+            persisted_recipes = []
+    _set_recipes(persisted_recipes or [])
+
     items_by_slot = {}
     for item in diet.get("items", []):
         day = GIORNI_MAP.get(item.get("giorno_settimana"))
@@ -2008,19 +2405,22 @@ def _load_diet_into_editor(diet):
             continue
         items_by_slot.setdefault((day, meal), []).append(item)
 
-    # Il budget generico viene ricostruito aggregando le grammature del piano salvato.
-    # Non esiste ancora una persistenza DB separata del budget: per i piani importati
-    # il target iniziale coincide quindi con la somma delle allocazioni salvate.
+    # Il Budget non ha una tabella separata: viene ricostruito dalle allocazioni persistite.
+    # Le righe recipe_id vengono prima esplose proporzionalmente nei relativi ingredienti.
     budget_by_food = {}
     budget_occurrences_by_food = {}
     for item in diet.get("items", []):
-        food_name = str(item.get("food_name") or "").strip()
-        grams = _safe_float(item.get("grams"))
-        if not food_name:
-            continue
-        budget_by_food[food_name] = budget_by_food.get(food_name, 0.0) + grams
-        if grams > 0:
-            budget_occurrences_by_food[food_name] = budget_occurrences_by_food.get(food_name, 0) + 1
+        row_foods = set()
+        for expanded in _expand_persisted_diet_item(item):
+            food_name = str(expanded.get("food_name") or "").strip()
+            grams = _safe_float(expanded.get("grams"))
+            if not food_name or grams <= 0:
+                continue
+            budget_by_food[food_name] = budget_by_food.get(food_name, 0.0) + grams
+            row_foods.add(_food_name_key(food_name))
+        for food_key in row_foods:
+            label = next((n for n in budget_by_food if _food_name_key(n) == food_key), food_key)
+            budget_occurrences_by_food[label] = budget_occurrences_by_food.get(label, 0) + 1
 
     budget_rows = max(4, len(budget_by_food))
     budget_df = _empty_weekly_budget(rows=budget_rows)
@@ -2070,7 +2470,7 @@ def _load_diet_into_editor(diet):
             ]
 
             for idx, item in enumerate(imported_items):
-                slot_df.at[idx, "Alimento"] = item.get("food_name")
+                slot_df.at[idx, "Alimento"] = _diet_item_display_choice(item)
                 slot_df.at[idx, "Grammi (g)"] = _safe_float(item.get("grams"))
 
             keys = _slot_keys(day, meal)
@@ -3597,12 +3997,195 @@ class DistributionRowOptionsRenderer {
         st.markdown("---")
 
         # ==============================================================
+        # RICETTE - aggregazioni persistenti di alimenti del Budget
+        # ==============================================================
+        st.markdown("### 🍳 Ricette")
+        st.caption(
+            "Raggruppa gli alimenti del Budget in ricette persistite su recipes / recipe_ingredients. "
+            "Nella Distribuzione una ricetta resta una singola riga con recipe_id; per il controllo Budget viene esplosa nei suoi ingredienti."
+        )
+        budget_targets_for_prep = _aggregate_budget_targets_from_draft(
+            st.session_state.get(WEEKLY_BUDGET_GRID_KEY)
+        )
+        available_prep_foods = sorted(budget_targets_for_prep.keys(), key=str.casefold)
+        preparations = _get_recipes()
+        prep_names = sorted(preparations.keys(), key=str.casefold)
+
+        prep_choice = st.selectbox(
+            "Ricetta da creare o modificare",
+            options=["➕ Nuova ricetta"] + prep_names,
+            key="diet_preparation_editor_choice",
+        )
+        editing_prep_name = None if prep_choice == "➕ Nuova ricetta" else prep_choice
+        editing_prep = preparations.get(editing_prep_name, {}) if editing_prep_name else {}
+        prep_key_suffix = re.sub(r"[^A-Za-z0-9]+", "_", editing_prep_name or "new").strip("_") or "new"
+
+        with st.expander("Definizione ricetta", expanded=not bool(prep_names) or editing_prep_name is not None):
+            pcol1, pcol2 = st.columns([2.2, 1])
+            with pcol1:
+                prep_name_value = st.text_input(
+                    "Nome ricetta",
+                    value=str(editing_prep.get("name") or ""),
+                    placeholder="es. Pancake / Frullato banana",
+                    key=f"diet_preparation_name_{prep_key_suffix}",
+                )
+            with pcol2:
+                prep_portions = st.number_input(
+                    "Porzioni teoriche",
+                    min_value=1,
+                    step=1,
+                    value=max(1, int(editing_prep.get("portions") or 1)),
+                    key=f"diet_preparation_portions_{prep_key_suffix}",
+                )
+
+            current_ingredients = {
+                str(item.get("food_name") or "").strip(): _safe_float(item.get("grams"))
+                for item in editing_prep.get("ingredients", []) or []
+                if str(item.get("food_name") or "").strip()
+            }
+            default_ingredients = [name for name in current_ingredients if name in available_prep_foods]
+            selected_prep_foods = st.multiselect(
+                "Ingredienti dal Budget settimanale",
+                options=available_prep_foods,
+                default=default_ingredients,
+                key=f"diet_preparation_ingredients_{prep_key_suffix}",
+            )
+
+            prep_ingredients = []
+            if selected_prep_foods:
+                st.caption("Indica la quantità del Budget utilizzata per l'intera preparazione.")
+                for idx, food_name in enumerate(selected_prep_foods):
+                    c1, c2, c3 = st.columns([2.3, 1.1, 1.2])
+                    with c1:
+                        st.write(food_name)
+                    with c2:
+                        target = _safe_float(budget_targets_for_prep.get(food_name))
+                        st.caption(f"Budget: {target:.1f} g")
+                    with c3:
+                        default_grams = _safe_float(current_ingredients.get(food_name))
+                        grams_value = st.number_input(
+                            f"g {food_name}",
+                            min_value=0.0,
+                            step=5.0,
+                            value=float(default_grams),
+                            label_visibility="collapsed",
+                            key=f"diet_preparation_grams_{prep_key_suffix}_{idx}_{_food_name_key(food_name)}",
+                        )
+                    if grams_value > 0:
+                        prep_ingredients.append({"food_id": food_dict[food_name]["id"], "food_name": food_name, "grams": float(grams_value)})
+
+            prep_total_grams = sum(_safe_float(i.get("grams")) for i in prep_ingredients)
+            if prep_total_grams > 0:
+                per_portion = prep_total_grams / max(1, int(prep_portions))
+                st.info(
+                    f"Peso teorico ricetta: **{prep_total_grams:.1f} g** · "
+                    f"circa **{per_portion:.1f} g per porzione**."
+                )
+
+            save_prep_col, delete_prep_col = st.columns(2)
+            with save_prep_col:
+                save_prep_clicked = st.button(
+                    "💾 Salva ricetta",
+                    key=f"save_preparation_{prep_key_suffix}",
+                    use_container_width=True,
+                )
+            with delete_prep_col:
+                delete_prep_clicked = st.button(
+                    "🗑️ Elimina ricetta",
+                    key=f"delete_preparation_{prep_key_suffix}",
+                    disabled=editing_prep_name is None,
+                    use_container_width=True,
+                )
+
+            if save_prep_clicked:
+                clean_prep_name = str(prep_name_value or "").strip()
+                all_preps = _get_recipes()
+                if not clean_prep_name:
+                    st.error("Inserisci un nome per la ricetta.")
+                elif not prep_ingredients:
+                    st.error("Seleziona almeno un ingrediente con quantità maggiore di 0.")
+                elif (
+                    clean_prep_name != editing_prep_name
+                    and clean_prep_name in all_preps
+                ):
+                    st.error(f"Esiste già una ricetta chiamata '{clean_prep_name}'.")
+                else:
+                    # Ogni ingrediente deve restare entro il proprio Budget complessivo.
+                    over_budget = [
+                        item["food_name"]
+                        for item in prep_ingredients
+                        if _safe_float(item["grams"]) > _safe_float(budget_targets_for_prep.get(item["food_name"])) + 0.05
+                    ]
+                    if over_budget:
+                        st.error(
+                            "Quantità della ricetta superiore al Budget per: "
+                            + ", ".join(over_budget)
+                        )
+                    else:
+                        if editing_prep_name and editing_prep_name != clean_prep_name:
+                            all_preps.pop(editing_prep_name, None)
+                            _rename_recipe_in_distribution(editing_prep_name, clean_prep_name)
+                        all_preps[clean_prep_name] = {
+                            "id": editing_prep.get("id") if editing_prep_name else None,
+                            "client_key": (
+                                editing_prep.get("client_key")
+                                if editing_prep_name
+                                else str(uuid.uuid4())
+                            ),
+                            "name": clean_prep_name,
+                            "portions": int(prep_portions),
+                            "ingredients": prep_ingredients,
+                        }
+                        st.session_state[RECIPES_KEY] = all_preps
+                        st.session_state["diet_preparation_flash"] = f"Ricetta '{clean_prep_name}' salvata nell'editor. Verrà persistita con il piano."
+                        st.session_state["diet_aggregations_dirty"] = True
+                        st.session_state["diet_budget_comparison_stale"] = True
+                        _rerun_after_numeric_sync()
+
+            if delete_prep_clicked and editing_prep_name:
+                if _recipe_is_used(editing_prep_name):
+                    st.error(
+                        "La ricetta è già usata nella Distribuzione. "
+                        "Rimuovi prima le relative allocazioni."
+                    )
+                else:
+                    all_preps = _get_recipes()
+                    all_preps.pop(editing_prep_name, None)
+                    st.session_state[RECIPES_KEY] = all_preps
+                    st.session_state["diet_preparation_flash"] = f"Ricetta '{editing_prep_name}' rimossa dall'editor. La modifica verrà persistita con il piano."
+                    _rerun_after_numeric_sync()
+
+        prep_flash = st.session_state.pop("diet_preparation_flash", None)
+        if prep_flash:
+            st.success(prep_flash)
+
+        preparations = _get_recipes()
+        if preparations:
+            prep_summary_rows = []
+            for prep_name, prep in sorted(preparations.items(), key=lambda x: x[0].casefold()):
+                total_g = _recipe_total_grams(prep)
+                profile = _recipe_profile(prep, food_js_db) or _zero_totals()
+                prep_summary_rows.append({
+                    "Ricetta": _recipe_label(prep_name),
+                    "Ingredienti": ", ".join(i["food_name"] for i in prep.get("ingredients", [])),
+                    "Peso totale (g)": round(total_g, 1),
+                    "Porzioni": int(prep.get("portions") or 1),
+                    "g / porzione": round(total_g / max(1, int(prep.get("portions") or 1)), 1),
+                    "Kcal / 100 g": round(_safe_float(profile.get("kcal")), 1),
+                })
+            st.dataframe(pd.DataFrame(prep_summary_rows), use_container_width=True, hide_index=True)
+        else:
+            st.caption("Nessuna ricetta definita. Puoi comunque usare direttamente gli alimenti nella Distribuzione.")
+
+        st.markdown("---")
+
+        # ==============================================================
         # DISTRIBUZIONE SETTIMANALE - unica grid con filtri
         # ==============================================================
         st.markdown("### Distribuzione settimanale")
         st.caption(
-            "Tutte le allocazioni sono nella stessa tabella. Filtra per giorno, pasto o alimento "
-            "e modifica direttamente tutte le occorrenze interessate."
+            "Tutte le allocazioni sono nella stessa tabella. Puoi usare un alimento singolo oppure una "
+            "ricetta (🍳). Le ricette sono persistite tramite recipe_id e vengono esplose solo per Budget e controlli."
         )
 
         distribution_flash = st.session_state.pop("diet_distribution_flash_message", None)
@@ -3637,6 +4220,8 @@ class DistributionRowOptionsRenderer {
             str(item.get("food_name") or "").strip()
             for item in st.session_state.get(WEEKLY_BUDGET_ITEMS_KEY, [])
             if str(item.get("food_name") or "").strip()
+        } | {
+            _recipe_label(name) for name in _get_recipes()
         }, key=str.casefold)
         current_food_filter = st.session_state.get("diet_distribution_filter_food", "Tutti")
         if current_food_filter not in (["Tutti"] + food_names):
@@ -3676,8 +4261,18 @@ class DistributionRowOptionsRenderer {
                 for row in last_rows
                 if str(row.get("Stato") or "") != "COERENTE"
             }
+            def _row_matches_incoherence(row):
+                choice = str(row.get("Alimento") or "").strip()
+                grams = _safe_float(row.get("Grammi (g)"))
+                expanded_keys = {
+                    _food_name_key(item.get("food_name"))
+                    for item in _expand_distribution_choice(choice, grams)
+                    if _food_name_key(item.get("food_name"))
+                }
+                return bool(expanded_keys & incoherent_keys)
+
             filtered_distribution = filtered_distribution.loc[
-                filtered_distribution["Alimento"].map(_food_name_key).isin(incoherent_keys)
+                filtered_distribution.apply(_row_matches_incoherence, axis=1)
             ]
             if st.session_state.get("diet_budget_comparison_stale", False):
                 st.caption("⚠️ Il filtro 'Solo incoerenti' usa l'ultimo check Budget, che è precedente alle ultime modifiche della Distribuzione.")
@@ -3694,6 +4289,8 @@ class DistributionRowOptionsRenderer {
         distribution_grid_container = st.container()
 
         allocation_food_js_db = _weekly_budget_allowed_food_db(food_js_db)
+        # Le preparazioni sono voci virtuali: i macro per 100 g derivano dagli ingredienti.
+        allocation_food_js_db.update(_recipe_food_db(food_js_db))
         # Per piani storici o budget appena modificati manteniamo visibili anche gli alimenti
         # già presenti nella Distribuzione, così possono essere corretti/rimossi.
         for existing_name in master_distribution["Alimento"].dropna().astype(str):
@@ -3722,8 +4319,17 @@ class DistributionRowOptionsRenderer {
                     cellEditorParams={"values": pasti_options}, minWidth=125, flex=1.1,
                 )
                 gb.configure_column(
-                    "Alimento", editable=True, singleClickEdit=True,
-                    cellEditor=food_autocomplete_editor, minWidth=240, flex=2.2,
+                    "Alimento", headerName="Alimento / Ricetta", editable=True, singleClickEdit=True,
+                    cellEditor=food_autocomplete_editor, minWidth=260, flex=2.3,
+                    cellStyle=JsCode("""
+                    function(params) {
+                        const v = String(params.value || '');
+                        if (v.startsWith('🍳 ')) {
+                            return {fontWeight: '600', backgroundColor: '#FFF8E8'};
+                        }
+                        return null;
+                    }
+                    """),
                 )
                 gb.configure_column(
                     "Grammi (g)", editable=True, type="numericColumn", minWidth=110, flex=0.9
@@ -3913,6 +4519,17 @@ class DistributionRowOptionsRenderer {
             )
             invalid_budget_foods = sorted({name for name in raw_budget_targets if name not in food_dict})
             invalid_distribution_foods = sorted({name for name in raw_allocated if name not in food_dict})
+            # Una ricetta non è un alimento DB: è valida se esiste nell'editor e
+            # tutti i suoi ingredienti, dopo l'espansione, appartengono al catalogo.
+            raw_distribution_df = _normalize_distribution_df(
+                st.session_state.get(DISTRIBUTION_GRID_KEY, _empty_distribution_df())
+            )
+            invalid_recipe_refs = sorted({
+                str(choice).strip()
+                for choice in raw_distribution_df["Alimento"].dropna().tolist()
+                if str(choice).strip().startswith(RECIPE_PREFIX)
+                and _recipe_name_from_label(choice) not in _get_recipes()
+            })
 
             if not normalized_name:
                 st.error("Inserisci un nome per il piano alimentare.")
@@ -3928,6 +4545,11 @@ class DistributionRowOptionsRenderer {
                     inconsistent_df if not inconsistent_df.empty else consistency_df,
                     use_container_width=True,
                     hide_index=True,
+                )
+            elif invalid_recipe_refs:
+                st.warning(
+                    "⚠️ Salvataggio bloccato: alcune ricette usate nella Distribuzione non esistono più: "
+                    + ", ".join(invalid_recipe_refs)
                 )
             elif invalid_budget_foods or invalid_distribution_foods:
                 invalid_names = sorted(set(invalid_budget_foods) | set(invalid_distribution_foods))
@@ -3964,6 +4586,7 @@ class DistributionRowOptionsRenderer {
                         "descrizione": descrizione,
                         "warnings": warnings,
                     }
+                    recipes_payload = _recipes_payload_for_persistence()
                     try:
                         if save_new_clicked:
                             if diet_name_exists(tec_conf, current_patient_id, normalized_name):
@@ -3972,8 +4595,8 @@ class DistributionRowOptionsRenderer {
                                     "per questo assistito. Scegli un nome diverso."
                                 )
                             else:
-                                new_diet_id = add_diet_plan(
-                                    tec_conf, diet_payload, temp_processed_items
+                                new_diet_id = add_diet_plan_with_recipes(
+                                    tec_conf, diet_payload, temp_processed_items, recipes_payload
                                 )
                                 st.session_state["diet_flash_message"] = (
                                     f"Nuovo piano '{normalized_name}' salvato con successo (ID: {new_diet_id})."
@@ -3994,8 +4617,8 @@ class DistributionRowOptionsRenderer {
                                     "per questo assistito."
                                 )
                             else:
-                                update_diet_plan(
-                                    tec_conf, loaded_id, diet_payload, temp_processed_items
+                                update_diet_plan_with_recipes(
+                                    tec_conf, loaded_id, diet_payload, temp_processed_items, recipes_payload
                                 )
                                 st.session_state["diet_loaded_plan_name"] = normalized_name
                                 st.session_state["diet_flash_message"] = (

@@ -4,46 +4,335 @@ from psycopg2.extras import RealDictCursor
 from Common.functions import connect, disconnect
 
 
-def _normalize_item_for_db(item: dict) -> dict:
-    """Converte il modello usato dalla UI nelle colonne persistite in diet_meal_items."""
+def _safe_positive_decimal(value, field_name: str) -> Decimal:
+    """Converte un valore numerico e verifica che sia strettamente positivo."""
+    try:
+        result = Decimal(str(value))
+    except Exception as exc:
+        raise ValueError(f"{field_name} non valido: {value!r}") from exc
+    if result <= 0:
+        raise ValueError(f"{field_name} deve essere maggiore di zero.")
+    return result
+
+
+def _normalize_item_for_db(item: dict, recipe_ref_map=None) -> dict:
+    """Converte il modello UI nelle colonne persistite in diet_meal_items.
+
+    Una riga rappresenta in modo esclusivo un alimento oppure una ricetta:
+    - food_id valorizzato e recipe_id NULL;
+    - recipe_id valorizzato e food_id NULL.
+
+    recipe_ref e una chiave client-side usata solo durante la transazione per
+    risolvere l'UUID di ricette appena create. Non viene persistita.
+    """
+    recipe_ref_map = recipe_ref_map or {}
+
+    food_id = item.get("food_id")
+    recipe_id = item.get("recipe_id")
+    recipe_ref = item.get("recipe_ref") or item.get("recipe_client_key")
+
+    # La chiave client ha precedenza: e fondamentale quando si salva come nuovo
+    # un piano importato, perche gli ID delle ricette originali non vanno riusati.
+    if recipe_ref is not None and str(recipe_ref) in recipe_ref_map:
+        recipe_id = recipe_ref_map[str(recipe_ref)]
+    elif recipe_id is not None and str(recipe_id) in recipe_ref_map:
+        recipe_id = recipe_ref_map[str(recipe_id)]
+
+    is_food = bool(food_id)
+    is_recipe = bool(recipe_id)
+    if is_food == is_recipe:
+        raise ValueError(
+            "Ogni diet_meal_item deve valorizzare uno e un solo riferimento tra food_id e recipe_id."
+        )
+
+    grams = _safe_positive_decimal(item.get("grams", 0), "grams")
+
+    food_name = item.get("food_name")
+    if is_food:
+        food_name = str(food_name or "").strip()
+        if not food_name:
+            raise ValueError("food_name mancante per un diet_meal_item di tipo food.")
+    else:
+        # Per le ricette il nome e normalizzato in recipes.name e non viene duplicato.
+        food_name = None
+
     return {
-        "food_id": item.get("food_id"),
+        "food_id": food_id if is_food else None,
+        "recipe_id": recipe_id if is_recipe else None,
         "giorno_settimana": item.get("giorno_settimana"),
         "meal_type": item.get("meal_type"),
-        "food_name": item.get("food_name"),
-        "grams": item.get("grams", 0),
-        "kcal_calculated": item.get("kcal_calculated", item.get("kcal", 0)),
-        "prot_calculated": item.get("prot_calculated", item.get("prot", 0)),
-        "carbs_calculated": item.get("carbs_calculated", item.get("carbs", 0)),
-        "fats_calculated": item.get("fats_calculated", item.get("fats", 0)),
+        "food_name": food_name,
+        "grams": grams,
+        "kcal_calculated": item.get("kcal_calculated", item.get("kcal")),
+        "prot_calculated": item.get("prot_calculated", item.get("prot")),
+        "carbs_calculated": item.get("carbs_calculated", item.get("carbs")),
+        "fats_calculated": item.get("fats_calculated", item.get("fats")),
     }
 
 
-def _insert_diet_items(cur, diet_id, items_data: list) -> None:
-    """Inserisce gli item di un piano usando un set di colonne esplicito e stabile."""
+def _insert_diet_items(
+    cur,
+    diet_id,
+    items_data: list,
+    recipe_ref_map=None,
+    allowed_recipe_ids=None,
+) -> None:
+    """Inserisce gli item del piano supportando food_id XOR recipe_id."""
     query = """
         INSERT INTO diet_meal_items (
-            diet_plan_id, food_id, giorno_settimana, meal_type, food_name, grams,
+            diet_plan_id, food_id, recipe_id, giorno_settimana, meal_type, food_name, grams,
             kcal_calculated, prot_calculated, carbs_calculated, fats_calculated
         )
         VALUES (
-            %(diet_plan_id)s, %(food_id)s, %(giorno_settimana)s, %(meal_type)s, %(food_name)s, %(grams)s,
-            %(kcal_calculated)s, %(prot_calculated)s, %(carbs_calculated)s, %(fats_calculated)s
+            %(diet_plan_id)s, %(food_id)s, %(recipe_id)s, %(giorno_settimana)s,
+            %(meal_type)s, %(food_name)s, %(grams)s, %(kcal_calculated)s,
+            %(prot_calculated)s, %(carbs_calculated)s, %(fats_calculated)s
         );
     """
-    for raw_item in items_data:
-        item = _normalize_item_for_db(raw_item)
+
+    allowed_recipe_ids = (
+        {str(value) for value in allowed_recipe_ids}
+        if allowed_recipe_ids is not None
+        else None
+    )
+
+    for raw_item in items_data or []:
+        item = _normalize_item_for_db(raw_item, recipe_ref_map=recipe_ref_map)
         item["diet_plan_id"] = diet_id
-        if not item.get("food_id"):
-            raise ValueError(
-                f"food_id mancante per l'alimento '{item.get('food_name')}'. "
-                "L'alimento deve essere presente nel catalogo foods prima del salvataggio."
-            )
+
+        if item.get("recipe_id") is not None and allowed_recipe_ids is not None:
+            if str(item["recipe_id"]) not in allowed_recipe_ids:
+                raise ValueError(
+                    f"La ricetta {item['recipe_id']} non appartiene al set di ricette del piano corrente."
+                )
+
         cur.execute(query, item)
 
 
+def _normalize_recipe_payload(recipe: dict) -> dict:
+    """Valida e normalizza una ricetta ricevuta dalla UI."""
+    if not isinstance(recipe, dict):
+        raise ValueError("Payload ricetta non valido.")
+
+    name = str(recipe.get("name") or "").strip()
+    if not name:
+        raise ValueError("Ogni ricetta deve avere un nome.")
+
+    try:
+        portions = int(recipe.get("portions") or 1)
+    except Exception as exc:
+        raise ValueError(f"Numero porzioni non valido per la ricetta '{name}'.") from exc
+    if portions <= 0:
+        raise ValueError(f"Il numero di porzioni della ricetta '{name}' deve essere maggiore di zero.")
+
+    # Aggrega eventuali duplicati dello stesso food_id.
+    ingredients_by_food = {}
+    for raw in recipe.get("ingredients", []) or []:
+        if not isinstance(raw, dict):
+            continue
+        food_id = raw.get("food_id")
+        if not food_id:
+            raise ValueError(f"Ingrediente senza food_id nella ricetta '{name}'.")
+        grams = _safe_positive_decimal(raw.get("grams", 0), f"grams ingrediente di '{name}'")
+        key = str(food_id)
+        if key not in ingredients_by_food:
+            ingredients_by_food[key] = {
+                "food_id": food_id,
+                "food_name": str(raw.get("food_name") or "").strip() or None,
+                "grams": Decimal("0"),
+            }
+        ingredients_by_food[key]["grams"] += grams
+
+    ingredients = list(ingredients_by_food.values())
+    if not ingredients:
+        raise ValueError(f"La ricetta '{name}' deve contenere almeno un ingrediente.")
+
+    recipe_id = recipe.get("id") or recipe.get("recipe_id")
+    client_key = recipe.get("client_key") or recipe_id
+
+    return {
+        "id": recipe_id,
+        "client_key": str(client_key) if client_key is not None else None,
+        "name": name,
+        "portions": portions,
+        "ingredients": ingredients,
+    }
+
+
+def _normalize_recipes_payload(recipes_data: list) -> list:
+    recipes = [_normalize_recipe_payload(recipe) for recipe in (recipes_data or [])]
+    seen_names = set()
+    for recipe in recipes:
+        key = recipe["name"].casefold()
+        if key in seen_names:
+            raise ValueError(f"Nome ricetta duplicato nel piano: '{recipe['name']}'.")
+        seen_names.add(key)
+    return recipes
+
+
+def _replace_recipe_ingredients(cur, recipe_id, ingredients: list) -> None:
+    """Replace atomico degli ingredienti della singola ricetta."""
+    cur.execute("DELETE FROM recipe_ingredients WHERE recipe_id = %s;", (recipe_id,))
+    query = """
+        INSERT INTO recipe_ingredients (recipe_id, food_id, grams)
+        VALUES (%s, %s, %s);
+    """
+    for ingredient in ingredients:
+        cur.execute(
+            query,
+            (recipe_id, ingredient["food_id"], ingredient["grams"]),
+        )
+
+
+def _insert_recipes_for_new_plan(cur, diet_id, recipes_data: list):
+    """Crea nuove ricette per un nuovo piano e restituisce la mappa client_key -> UUID."""
+    recipes = _normalize_recipes_payload(recipes_data)
+    recipe_ref_map = {}
+    created_ids = set()
+
+    for recipe in recipes:
+        cur.execute(
+            """
+            INSERT INTO recipes (name, diet_plan_id, portions)
+            VALUES (%s, %s, %s)
+            RETURNING id;
+            """,
+            (recipe["name"], diet_id, recipe["portions"]),
+        )
+        recipe_id = cur.fetchone()["id"]
+        created_ids.add(str(recipe_id))
+
+        # Mappa sia client_key sia l'eventuale vecchio ID. Quest'ultimo serve
+        # quando un piano esistente viene importato e poi salvato come nuovo.
+        if recipe.get("client_key"):
+            recipe_ref_map[str(recipe["client_key"])] = recipe_id
+        if recipe.get("id"):
+            recipe_ref_map[str(recipe["id"])] = recipe_id
+        recipe_ref_map[str(recipe_id)] = recipe_id
+
+        _replace_recipe_ingredients(cur, recipe_id, recipe["ingredients"])
+
+    return recipe_ref_map, created_ids
+
+
+def _sync_recipes_for_existing_plan(cur, diet_id, recipes_data: list):
+    """Sincronizza le ricette del piano, mantenendo gli UUID esistenti quando possibile.
+
+    Restituisce:
+    - mapping client_key/id -> recipe_id effettivo;
+    - set degli ID da mantenere;
+    - set degli ID da eliminare dopo il replace dei meal item.
+    """
+    recipes = _normalize_recipes_payload(recipes_data)
+
+    cur.execute(
+        "SELECT id FROM recipes WHERE diet_plan_id = %s FOR UPDATE;",
+        (diet_id,),
+    )
+    existing_ids = {str(row["id"]) for row in cur.fetchall()}
+
+    recipe_ref_map = {}
+    keep_ids = set()
+
+    for recipe in recipes:
+        requested_id = str(recipe["id"]) if recipe.get("id") else None
+        if requested_id:
+            if requested_id not in existing_ids:
+                raise ValueError(
+                    f"La ricetta {requested_id} non appartiene al piano alimentare {diet_id}."
+                )
+            recipe_id = recipe["id"]
+            cur.execute(
+                """
+                UPDATE recipes
+                SET name = %s, portions = %s
+                WHERE id = %s AND diet_plan_id = %s;
+                """,
+                (recipe["name"], recipe["portions"], recipe_id, diet_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError(f"Impossibile aggiornare la ricetta {requested_id}.")
+        else:
+            cur.execute(
+                """
+                INSERT INTO recipes (name, diet_plan_id, portions)
+                VALUES (%s, %s, %s)
+                RETURNING id;
+                """,
+                (recipe["name"], diet_id, recipe["portions"]),
+            )
+            recipe_id = cur.fetchone()["id"]
+
+        keep_ids.add(str(recipe_id))
+        recipe_ref_map[str(recipe_id)] = recipe_id
+        if recipe.get("client_key"):
+            recipe_ref_map[str(recipe["client_key"])] = recipe_id
+        if recipe.get("id"):
+            recipe_ref_map[str(recipe["id"])] = recipe_id
+
+        _replace_recipe_ingredients(cur, recipe_id, recipe["ingredients"])
+
+    removed_ids = existing_ids - keep_ids
+    return recipe_ref_map, keep_ids, removed_ids
+
+
+def get_recipes_for_diet(conf, diet_plan_id) -> list:
+    """Recupera le ricette del piano con i relativi ingredienti e nomi food."""
+    conn = connect(conf)
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    r.id AS recipe_id,
+                    r.diet_plan_id,
+                    r.name,
+                    r.portions,
+                    ri.id AS ingredient_id,
+                    ri.food_id,
+                    ri.grams,
+                    f.item_name AS food_name
+                FROM recipes r
+                LEFT JOIN recipe_ingredients ri ON ri.recipe_id = r.id
+                LEFT JOIN foods f ON f.id = ri.food_id
+                WHERE r.diet_plan_id = %s
+                ORDER BY LOWER(r.name), f.item_name;
+                """,
+                (diet_plan_id,),
+            )
+            rows = cur.fetchall()
+
+        by_id = {}
+        for row in rows:
+            recipe_id = row["recipe_id"]
+            key = str(recipe_id)
+            if key not in by_id:
+                by_id[key] = {
+                    "id": recipe_id,
+                    "recipe_id": recipe_id,
+                    "diet_plan_id": row["diet_plan_id"],
+                    "name": row["name"],
+                    "portions": row["portions"],
+                    "ingredients": [],
+                }
+            if row.get("ingredient_id") is not None:
+                by_id[key]["ingredients"].append({
+                    "id": row["ingredient_id"],
+                    "food_id": row["food_id"],
+                    "food_name": row.get("food_name"),
+                    "grams": row["grams"],
+                })
+
+        return list(by_id.values())
+    except Exception as e:
+        logging.error(f"Errore in get_recipes_for_diet: {e}")
+        raise
+    finally:
+        disconnect(conn)
+
+
 def get_diet_plans(conf, patient_id: str) -> list:
-    """Recupera i piani alimentari di un assistito raggruppando i relativi item."""
+    """Recupera i piani alimentari con meal item di tipo food o recipe."""
     conn = connect(conf)
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -55,6 +344,8 @@ def get_diet_plans(conf, patient_id: str) -> list:
                     dp.descrizione,
                     dp.warnings,
                     dmi.food_id,
+                    dmi.recipe_id,
+                    r.name AS recipe_name,
                     dmi.giorno_settimana,
                     dmi.meal_type,
                     dmi.food_name,
@@ -65,8 +356,13 @@ def get_diet_plans(conf, patient_id: str) -> list:
                     dmi.fats_calculated
                 FROM diet_plans dp
                 LEFT JOIN diet_meal_items dmi ON dp.id = dmi.diet_plan_id
+                LEFT JOIN recipes r ON r.id = dmi.recipe_id
                 WHERE dp.patient_id = %s
-                ORDER BY dp.diet_name, dmi.giorno_settimana, dmi.meal_type, dmi.food_name;
+                ORDER BY
+                    dp.diet_name,
+                    dmi.giorno_settimana,
+                    dmi.meal_type,
+                    COALESCE(dmi.food_name, r.name);
                 """,
                 (patient_id,),
             )
@@ -87,10 +383,12 @@ def get_diet_plans(conf, patient_id: str) -> list:
             # LEFT JOIN: un piano senza item deve comunque essere restituito.
             if row.get("giorno_settimana") is not None:
                 plans_by_id[diet_id]["items"].append({
-                    "food_id": row["food_id"],
+                    "food_id": row.get("food_id"),
+                    "recipe_id": row.get("recipe_id"),
+                    "recipe_name": row.get("recipe_name"),
                     "giorno_settimana": row["giorno_settimana"],
                     "meal_type": row["meal_type"],
-                    "food_name": row["food_name"],
+                    "food_name": row.get("food_name"),
                     "grams": row["grams"],
                     "kcal_calculated": row["kcal_calculated"],
                     "prot_calculated": row["prot_calculated"],
@@ -131,8 +429,13 @@ def diet_name_exists(conf, patient_id: str, diet_name: str, exclude_diet_id=None
         disconnect(conn)
 
 
-def add_diet_plan(conf, diet_data: dict, items_data: list) -> str:
-    """Inserisce un nuovo piano alimentare con i rispettivi elementi nel database."""
+def add_diet_plan_with_recipes(
+    conf,
+    diet_data: dict,
+    items_data: list,
+    recipes_data: list,
+) -> str:
+    """Inserisce piano, ricette, ingredienti e distribuzione in un'unica transazione."""
     conn = connect(conf)
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -145,24 +448,45 @@ def add_diet_plan(conf, diet_data: dict, items_data: list) -> str:
                 diet_data,
             )
             diet_id = cur.fetchone()["id"]
-            _insert_diet_items(cur, diet_id, items_data)
+
+            recipe_ref_map, created_recipe_ids = _insert_recipes_for_new_plan(
+                cur, diet_id, recipes_data
+            )
+            _insert_diet_items(
+                cur,
+                diet_id,
+                items_data,
+                recipe_ref_map=recipe_ref_map,
+                allowed_recipe_ids=created_recipe_ids,
+            )
 
         conn.commit()
-        logging.info(f"Piano alimentare {diet_id} inserito con successo.")
+        logging.info(f"Piano alimentare {diet_id} con ricette inserito con successo.")
         return str(diet_id)
     except Exception as e:
         conn.rollback()
-        logging.error(f"Errore in add_diet_plan: {e}")
+        logging.error(f"Errore in add_diet_plan_with_recipes: {e}")
         raise
     finally:
         disconnect(conn)
 
 
-def update_diet_plan(conf, diet_id, diet_data: dict, items_data: list) -> str:
-    """Aggiorna testata e dettaglio di un piano esistente in un'unica transazione."""
+def add_diet_plan(conf, diet_data: dict, items_data: list) -> str:
+    """Compatibilita: inserisce un piano senza ricette."""
+    return add_diet_plan_with_recipes(conf, diet_data, items_data, [])
+
+
+def update_diet_plan_with_recipes(
+    conf,
+    diet_id,
+    diet_data: dict,
+    items_data: list,
+    recipes_data: list,
+) -> str:
+    """Aggiorna testata, ricette e distribuzione come unico replace transazionale."""
     conn = connect(conf)
     try:
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
                 UPDATE diet_plans
@@ -172,35 +496,55 @@ def update_diet_plan(conf, diet_id, diet_data: dict, items_data: list) -> str:
                 WHERE id = %(diet_id)s
                   AND patient_id = %(patient_id)s;
                 """,
-                {
-                    **diet_data,
-                    "diet_id": diet_id,
-                },
+                {**diet_data, "diet_id": diet_id},
             )
             if cur.rowcount != 1:
                 raise ValueError("Piano alimentare non trovato per l'assistito selezionato.")
 
-            # Replace atomico del dettaglio: o viene aggiornato tutto, o viene fatto rollback.
+            # Elimina prima le allocazioni: recipe_id usa ON DELETE RESTRICT.
             cur.execute("DELETE FROM diet_meal_items WHERE diet_plan_id = %s;", (diet_id,))
-            _insert_diet_items(cur, diet_id, items_data)
+
+            recipe_ref_map, keep_recipe_ids, removed_recipe_ids = _sync_recipes_for_existing_plan(
+                cur, diet_id, recipes_data
+            )
+
+            _insert_diet_items(
+                cur,
+                diet_id,
+                items_data,
+                recipe_ref_map=recipe_ref_map,
+                allowed_recipe_ids=keep_recipe_ids,
+            )
+
+            # Le ricette rimosse dall'editor vengono eliminate solo dopo il replace
+            # dei meal item, cosi nessun FK recipe_id puo ancora referenziarle.
+            if removed_recipe_ids:
+                cur.execute(
+                    "DELETE FROM recipes WHERE diet_plan_id = %s AND id = ANY(%s::uuid[]);",
+                    (diet_id, list(removed_recipe_ids)),
+                )
 
         conn.commit()
-        logging.info(f"Piano alimentare {diet_id} aggiornato con successo.")
+        logging.info(f"Piano alimentare {diet_id} con ricette aggiornato con successo.")
         return str(diet_id)
     except Exception as e:
         conn.rollback()
-        logging.error(f"Errore in update_diet_plan: {e}")
+        logging.error(f"Errore in update_diet_plan_with_recipes: {e}")
         raise
     finally:
         disconnect(conn)
 
 
+def update_diet_plan(conf, diet_id, diet_data: dict, items_data: list) -> str:
+    """Compatibilita: full replace di un piano senza ricette."""
+    return update_diet_plan_with_recipes(conf, diet_id, diet_data, items_data, [])
+
+
 def delete_diet_plan(conf, patient_id: str, diet_id) -> None:
-    """Elimina un piano alimentare dell'assistito e i relativi item in modo atomico."""
+    """Elimina piano, distribuzione e ricette in modo atomico."""
     conn = connect(conf)
     try:
         with conn.cursor() as cur:
-            # Verifica ownership prima di eliminare il dettaglio.
             cur.execute(
                 """
                 SELECT 1
@@ -214,13 +558,14 @@ def delete_diet_plan(conf, patient_id: str, diet_id) -> None:
             if cur.fetchone() is None:
                 raise ValueError("Piano alimentare non trovato per l'assistito selezionato.")
 
-            # Cancellazione esplicita del dettaglio: non dipende dalla presenza di ON DELETE CASCADE.
+            # Ordine necessario con diet_meal_items.recipe_id ON DELETE RESTRICT.
             cur.execute("DELETE FROM diet_meal_items WHERE diet_plan_id = %s;", (diet_id,))
+            # recipe_ingredients viene eliminata da ON DELETE CASCADE su recipe_id.
+            cur.execute("DELETE FROM recipes WHERE diet_plan_id = %s;", (diet_id,))
             cur.execute(
                 "DELETE FROM diet_plans WHERE id = %s AND patient_id = %s;",
                 (diet_id, patient_id),
             )
-
             if cur.rowcount != 1:
                 raise ValueError("Impossibile eliminare il piano alimentare selezionato.")
 
