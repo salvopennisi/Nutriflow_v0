@@ -2,7 +2,7 @@ import logging
 import inspect
 import importlib.metadata
 from datetime import datetime
-from io import BytesIO
+from io import BytesIO, StringIO
 import html
 import re
 import uuid
@@ -25,6 +25,8 @@ from Backend.services.diet_service import (
     get_recipes_for_diet,
     add_diet_plan_with_recipes,
     update_diet_plan_with_recipes,
+    save_recipe_for_diet,
+    delete_recipe_from_diet,
 )
 from Backend.services.food_service import get_foods_for_diet_editor
 
@@ -188,9 +190,9 @@ GIORNI_MAP = {
 
 MEAL_ORDER = {
     "Colazione": 1,
-    "Spuntino": 2,
+    "Merenda": 2,
     "Pranzo": 3,
-    "Merenda": 4,
+    "Spuntino": 4,
     "Cena": 5,
 }
 
@@ -208,6 +210,52 @@ def _pdf_number(value) -> float:
 def _pdf_text(value) -> str:
     """Testo sicuro per i Paragraph ReportLab."""
     return html.escape(str(value if value not in (None, "") else "N/D"))
+
+
+def _pdf_quantity_text(item: dict) -> str:
+    """Usa i pezzi quando disponibili; la persistenza resta sempre in grammi."""
+    raw_pieces = (item or {}).get("pieces") or (item or {}).get("pezzi")
+    try:
+        pieces = int(float(raw_pieces)) if raw_pieces not in (None, "") else 0
+    except Exception:
+        pieces = 0
+    if pieces > 0:
+        return f"{pieces} pz"
+    return f"{_pdf_number((item or {}).get('grams')):.1f} g"
+
+
+def _piece_snapshot_db_key(item: dict) -> str:
+    source_type = "recipe" if (item or {}).get("recipe_id") else "food"
+    source_id = (item or {}).get("recipe_id") or (item or {}).get("food_id") or ""
+    return "|".join([
+        str((item or {}).get("giorno_settimana") or ""),
+        str((item or {}).get("meal_type") or "").strip(),
+        source_type,
+        str(source_id),
+        f"{_pdf_number((item or {}).get('grams')):.2f}",
+    ])
+
+
+def _diet_with_transient_pieces(diet: dict) -> dict:
+    """Reinietta i pezzi dalla sessione senza salvarli nel DB."""
+    diet_id = str((diet or {}).get("id") or "")
+    snapshot = st.session_state.get(f"diet_piece_snapshot_{diet_id}") or {}
+    if not snapshot:
+        return diet
+
+    queues = {str(key): list(values or []) for key, values in snapshot.items()}
+    result = dict(diet or {})
+    enriched_items = []
+    for raw_item in (diet or {}).get("items", []) or []:
+        item = dict(raw_item)
+        key = _piece_snapshot_db_key(item)
+        values = queues.get(key) or []
+        if values:
+            item["pieces"] = values.pop(0)
+            queues[key] = values
+        enriched_items.append(item)
+    result["items"] = enriched_items
+    return result
 
 
 def _saved_recipe_map(diet: dict) -> dict:
@@ -684,6 +732,53 @@ def _build_diet_pdf(diet: dict, patient_name: str) -> bytes:
         alignments={0: "LEFT", 1: "RIGHT"},
     ))
 
+    # Sezione ricette: sempre dopo la lista della spesa e prima delle giornate.
+    recipes = sorted(
+        list(diet.get("recipes") or []),
+        key=lambda recipe: str(recipe.get("name") or "").casefold(),
+    )
+    if recipes:
+        story.append(PageBreak())
+        story.append(Paragraph("Ricette", h1_style))
+        story.append(Paragraph(
+            "Preparazioni utilizzabili nella distribuzione settimanale.",
+            body_style,
+        ))
+        for recipe in recipes:
+            recipe_name = str(recipe.get("name") or "Ricetta").strip()
+            description = str(recipe.get("description") or "").strip()
+            portions = max(1, int(recipe.get("portions") or 1))
+            ingredients = list(recipe.get("ingredients") or [])
+            total_grams = sum(_pdf_number(item.get("grams")) for item in ingredients)
+            per_portion = total_grams / portions if portions else 0.0
+
+            story.append(Paragraph(_pdf_text(recipe_name), h2_style))
+            if description:
+                story.append(Paragraph(_pdf_text(description), body_style))
+            story.append(Paragraph(
+                f"Porzioni: {portions} - Peso totale: {total_grams:.1f} g - "
+                f"Peso indicativo per porzione: {per_portion:.1f} g",
+                small_style,
+            ))
+
+            recipe_data = [[
+                Paragraph("Ingrediente", table_header_style),
+                Paragraph("Quantità", table_header_style),
+            ]]
+            for ingredient in ingredients:
+                recipe_data.append([
+                    Paragraph(_pdf_text(ingredient.get("food_name") or "N/D"), small_style),
+                    f"{_pdf_number(ingredient.get('grams')):.1f} g",
+                ])
+            if len(recipe_data) == 1:
+                recipe_data.append(["Nessun ingrediente", "-"])
+            story.append(_styled_table(
+                recipe_data,
+                [122 * mm, 43 * mm],
+                alignments={0: "LEFT", 1: "RIGHT"},
+            ))
+            story.append(Spacer(1, 4 * mm))
+
     # Pagine successive - un giorno per pagina.
     for day_code, day_name in GIORNI_MAP.items():
         story.append(PageBreak())
@@ -711,7 +806,7 @@ def _build_diet_pdf(diet: dict, patient_name: str) -> bytes:
         detail_data = [[
             Paragraph("Pasto", table_header_style),
             Paragraph("Alimento", table_header_style),
-            Paragraph("g", table_header_style),
+            Paragraph("Quantità", table_header_style),
             Paragraph("Kcal", table_header_style),
             Paragraph("Carb", table_header_style),
             Paragraph("Grassi", table_header_style),
@@ -722,7 +817,7 @@ def _build_diet_pdf(diet: dict, patient_name: str) -> bytes:
                 detail_data.append([
                     Paragraph(_pdf_text(item.get("meal_type")), small_style),
                     Paragraph(_pdf_text(_saved_item_display_name(diet, item)), small_style),
-                    f"{_pdf_number(item.get('grams')):.1f}",
+                    _pdf_quantity_text(item),
                     f"{_pdf_number(item.get('kcal_calculated')):.1f}",
                     f"{_pdf_number(item.get('carbs_calculated')):.1f}",
                     f"{_pdf_number(item.get('fats_calculated')):.1f}",
@@ -779,6 +874,7 @@ selected_patient_full_name = (
 def _clear_editor_state_if_deleted(diet_id):
     """Evita che l'editor mantenga in sessione un piano appena eliminato."""
     st.session_state.pop(f"diet_micronutrient_overview_{diet_id}", None)
+    st.session_state.pop(f"diet_piece_snapshot_{diet_id}", None)
     if str(st.session_state.get("diet_loaded_plan_id")) != str(diet_id):
         return
 
@@ -806,6 +902,8 @@ def _clear_editor_state_if_deleted(diet_id):
         "diet_plan_import_select",
         "diet_import_needs_recalc",
         "diet_aggregations_dirty",
+        DISTRIBUTION_CSV_VISIBLE_KEY if "DISTRIBUTION_CSV_VISIBLE_KEY" in globals() else "show_distribution_csv_v1",
+        DISTRIBUTION_CSV_TEXT_KEY if "DISTRIBUTION_CSV_TEXT_KEY" in globals() else "diet_distribution_csv_text_v1",
     ):
         st.session_state.pop(key, None)
 
@@ -895,6 +993,7 @@ with tab_list:
         st.info("Nessun piano alimentare associato a questo assistito.")
     else:
         for diet in patient_diets:
+            diet = _diet_with_transient_pieces(diet)
             with st.expander(f"📁 {diet['diet_name']} (ID: {diet['id']})"):
                 action_download_col, action_shopping_col, action_micro_col, action_delete_col = st.columns(4)
 
@@ -1046,7 +1145,7 @@ with tab_list:
                             "Giorno": GIORNI_MAP.get(item['giorno_settimana'], "N/D"),
                             "Pasto": item['meal_type'],
                             "Item": _saved_item_display_name(diet, item),
-                            "Grammi (g)": item['grams'],
+                            "Quantità": _pdf_quantity_text(item),
                             "Kcal": item['kcal_calculated'],
                             "Carbs (g)": item['carbs_calculated'],
                             "Fats (g)": item['fats_calculated'],
@@ -1513,19 +1612,46 @@ DISTRIBUTION_WEEKLY_TOTALS_KEY = "diet_distribution_weekly_totals_v1"
 
 
 def _empty_distribution_df(rows=4):
-    """DataFrame canonico della distribuzione: una riga = una allocazione."""
+    """DataFrame canonico della distribuzione: una riga = una allocazione.
+
+    __item_id + Alimento costituiscono la coppia tecnica ID/nome. In AG Grid
+    l'ID resta nascosto: l'utente vede e modifica solo il nome dell'item.
+    Pezzi e esclusivamente un dato di rappresentazione e NON viene persistito.
+    """
     return pd.DataFrame({
         "option": [""] * rows,
         "__row_id": [f"dist_{i}" for i in range(rows)],
         "__action_touch": [0] * rows,
-        # La cancellazione e esplicita: non viene mai dedotta da una response
-        # parziale/vuota di AG Grid, che puo verificarsi durante mount/rerun.
         "__deleted": [0] * rows,
+        "__item_id": [None] * rows,
+        "__item_type": [None] * rows,
         "Giorno": [None] * rows,
         "Pasto": [None] * rows,
         "Alimento": [None] * rows,
         "Grammi (g)": [0.0] * rows,
+        "Pezzi": [0] * rows,
     })
+
+
+def _pieces_value(value) -> int:
+    """Normalizza il numero pezzi. Zero significa: rappresenta l'item in grammi."""
+    if value is None:
+        return 0
+    try:
+        if pd.isna(value):
+            return 0
+    except Exception:
+        pass
+    raw = str(value).strip().replace(",", ".")
+    if not raw:
+        return 0
+    try:
+        numeric = float(raw)
+    except Exception:
+        return 0
+    if numeric <= 0 or not numeric.is_integer():
+        return 0
+    return int(numeric)
 
 
 def _normalize_distribution_df(data):
@@ -1535,10 +1661,13 @@ def _normalize_distribution_df(data):
         "option": "",
         "__action_touch": 0,
         "__deleted": 0,
+        "__item_id": None,
+        "__item_type": None,
         "Giorno": None,
         "Pasto": None,
         "Alimento": None,
         "Grammi (g)": 0.0,
+        "Pezzi": 0,
     }
     for col, default in defaults.items():
         if col not in df.columns:
@@ -1548,12 +1677,261 @@ def _normalize_distribution_df(data):
 
     df = df[[
         "option", "__row_id", "__action_touch", "__deleted",
-        "Giorno", "Pasto", "Alimento", "Grammi (g)"
+        "__item_id", "__item_type",
+        "Giorno", "Pasto", "Alimento", "Grammi (g)", "Pezzi"
     ]]
     df["__row_id"] = df["__row_id"].astype(str)
     df["__deleted"] = pd.to_numeric(df["__deleted"], errors="coerce").fillna(0).astype(int)
     df["Grammi (g)"] = pd.to_numeric(df["Grammi (g)"], errors="coerce").fillna(0.0)
+    df["Pezzi"] = df["Pezzi"].map(_pieces_value)
+    df["__item_id"] = df["__item_id"].map(
+        lambda value: None if value is None or str(value).strip() in {"", "nan", "None"} else str(value).strip()
+    )
+    df["__item_type"] = df["__item_type"].map(
+        lambda value: None if value is None or str(value).strip() in {"", "nan", "None"} else str(value).strip().lower()
+    )
     return df
+
+
+def _sync_distribution_identity(data, food_dict):
+    """Sincronizza la coppia tecnica (__item_id, Alimento) per food e recipe.
+
+    L'utente vede solo Alimento. Ogni volta che la grid viene consolidata,
+    l'ID nascosto viene ricalcolato dal catalogo/ricette correnti, evitando
+    associazioni stale dopo la modifica del nome da frontend.
+    """
+    df = _normalize_distribution_df(data)
+    recipes = _get_recipes()
+    for idx, row in df.iterrows():
+        choice = "" if pd.isna(row.get("Alimento")) else str(row.get("Alimento") or "").strip()
+        if not choice:
+            df.at[idx, "__item_id"] = None
+            df.at[idx, "__item_type"] = None
+            continue
+
+        recipe_name = _recipe_name_from_label(choice)
+        if recipe_name is not None:
+            recipe = recipes.get(recipe_name)
+            if recipe:
+                df.at[idx, "__item_id"] = str(recipe.get("id") or recipe.get("client_key") or "") or None
+                df.at[idx, "__item_type"] = "recipe"
+            else:
+                df.at[idx, "__item_id"] = None
+                df.at[idx, "__item_type"] = "recipe"
+            continue
+
+        food = food_dict.get(choice)
+        if food and food.get("id"):
+            df.at[idx, "__item_id"] = str(food.get("id"))
+            df.at[idx, "__item_type"] = "food"
+        else:
+            df.at[idx, "__item_id"] = None
+            df.at[idx, "__item_type"] = "food"
+    return _normalize_distribution_df(df)
+
+
+def _sort_distribution_df(data):
+    """Ordina per giorno Lunedì->Domenica e poi Colazione, Merenda, Pranzo, Spuntino, Cena."""
+    df = _normalize_distribution_df(data)
+    day_rank = {label: code for code, label in GIORNI_MAP.items()}
+    df["__day_order"] = df["Giorno"].map(lambda x: day_rank.get(str(x).strip(), 99))
+    df["__meal_order"] = df["Pasto"].map(lambda x: MEAL_ORDER.get(str(x).strip(), 99))
+    df["__original_order"] = range(len(df))
+    df = df.sort_values(
+        by=["__day_order", "__meal_order", "__original_order"],
+        kind="stable",
+    ).drop(columns=["__day_order", "__meal_order", "__original_order"])
+    return _normalize_distribution_df(df.reset_index(drop=True))
+
+
+DISTRIBUTION_CSV_TEXT_KEY = "diet_distribution_csv_text_v1"
+DISTRIBUTION_CSV_VISIBLE_KEY = "show_distribution_csv_v1"
+
+
+def _distribution_csv_dataframe(data, food_dict):
+    """Esporta il master in CSV esplicito ID + nome, mantenendo Pezzi solo come presentazione."""
+    df = _sync_distribution_identity(data, food_dict)
+    rows = []
+    recipes = _get_recipes()
+    for _, row in df.iterrows():
+        choice = "" if pd.isna(row.get("Alimento")) else str(row.get("Alimento") or "").strip()
+        if not choice and _safe_float(row.get("Grammi (g)")) <= 0:
+            continue
+        item_type = str(row.get("__item_type") or "").strip().lower()
+        item_id = str(row.get("__item_id") or "").strip()
+        item_name = choice
+        if item_type == "recipe":
+            recipe_name = _recipe_name_from_label(choice)
+            recipe = recipes.get(recipe_name) if recipe_name else None
+            item_name = str((recipe or {}).get("name") or recipe_name or choice).strip()
+        rows.append({
+            "Giorno": row.get("Giorno") or "",
+            "Pasto": row.get("Pasto") or "",
+            "Tipo": item_type,
+            "Item ID": item_id,
+            "Item Name": item_name,
+            "Grammi (g)": round(_safe_float(row.get("Grammi (g)")), 2),
+            "Pezzi": _pieces_value(row.get("Pezzi")),
+        })
+    return pd.DataFrame(rows, columns=[
+        "Giorno", "Pasto", "Tipo", "Item ID", "Item Name", "Grammi (g)", "Pezzi"
+    ])
+
+
+def _distribution_to_csv_text(data, food_dict):
+    return _distribution_csv_dataframe(data, food_dict).to_csv(
+        index=False, sep=";", decimal=","
+    )
+
+
+def _parse_csv_number(value, field_name, row_number):
+    raw = str(value or "").strip().replace(".", "").replace(",", ".")
+    # Se il CSV e stato prodotto con decimal='.' non vogliamo rimuovere il punto
+    # decimale. Ripristiniamo il caso semplice con un solo punto e nessuna virgola.
+    original = str(value or "").strip()
+    if "," not in original and original.count(".") <= 1:
+        raw = original
+    try:
+        return float(raw)
+    except Exception as exc:
+        raise ValueError(f"Riga {row_number}: {field_name} non valido ({value!r}).") from exc
+
+
+def _distribution_from_csv_text(text_value, food_dict, days, meals):
+    """Importa la Distribuzione da CSV validando la tupla ID + Item Name."""
+    text_value = str(text_value or "").strip()
+    if not text_value:
+        return _empty_distribution_df(rows=0)
+
+    frame = pd.read_csv(StringIO(text_value), sep=";", dtype=str, keep_default_na=False)
+    required = ["Giorno", "Pasto", "Tipo", "Item ID", "Item Name", "Grammi (g)"]
+    missing = [col for col in required if col not in frame.columns]
+    if missing:
+        raise ValueError("CSV Distribuzione: colonne mancanti: " + ", ".join(missing))
+    if "Pezzi" not in frame.columns:
+        frame["Pezzi"] = ""
+
+    food_by_id = {
+        str(food.get("id")): name
+        for name, food in food_dict.items()
+        if food.get("id")
+    }
+    recipes = _get_recipes()
+    recipe_by_id = {}
+    for recipe in recipes.values():
+        rid = recipe.get("id") or recipe.get("client_key")
+        if rid:
+            recipe_by_id[str(rid)] = recipe
+
+    allowed_days = set(days)
+    allowed_meals = set(meals)
+    rows = []
+    for idx, raw in frame.iterrows():
+        row_number = idx + 2
+        day = _resolve_distribution_day_label(raw.get("Giorno"))
+        if day not in allowed_days:
+            raise ValueError(f"Riga {row_number}: Giorno non valido: {raw.get('Giorno')!r}.")
+
+        meal_raw = str(raw.get("Pasto") or "").strip()
+        meal = next((m for m in meals if m.casefold() == meal_raw.casefold()), None)
+        if meal not in allowed_meals:
+            raise ValueError(f"Riga {row_number}: Pasto non valido: {meal_raw!r}.")
+
+        item_type = str(raw.get("Tipo") or "").strip().lower()
+        if item_type not in {"food", "recipe"}:
+            raise ValueError(f"Riga {row_number}: Tipo deve essere 'food' oppure 'recipe'.")
+
+        item_id = str(raw.get("Item ID") or "").strip()
+        item_name = str(raw.get("Item Name") or "").strip()
+        if not item_id or not item_name:
+            raise ValueError(f"Riga {row_number}: Item ID e Item Name sono obbligatori.")
+
+        if item_type == "food":
+            canonical_name = food_by_id.get(item_id)
+            if canonical_name is None:
+                raise ValueError(f"Riga {row_number}: food_id {item_id} non presente nel catalogo corrente.")
+            if _food_name_key(canonical_name) != _food_name_key(item_name):
+                raise ValueError(
+                    f"Riga {row_number}: la coppia food_id / Item Name non coincide: "
+                    f"{item_id} corrisponde a '{canonical_name}', non a '{item_name}'."
+                )
+            display_choice = canonical_name
+        else:
+            recipe = recipe_by_id.get(item_id)
+            if recipe is None:
+                raise ValueError(f"Riga {row_number}: recipe_id {item_id} non appartiene al piano corrente.")
+            canonical_name = str(recipe.get("name") or "").strip()
+            if _food_name_key(canonical_name) != _food_name_key(item_name):
+                raise ValueError(
+                    f"Riga {row_number}: la coppia recipe_id / Item Name non coincide: "
+                    f"{item_id} corrisponde a '{canonical_name}', non a '{item_name}'."
+                )
+            display_choice = _recipe_label(canonical_name)
+
+        grams = _parse_csv_number(raw.get("Grammi (g)"), "Grammi (g)", row_number)
+        if grams <= 0:
+            raise ValueError(f"Riga {row_number}: Grammi (g) deve essere maggiore di zero.")
+
+        pieces_raw = str(raw.get("Pezzi") or "").strip()
+        pieces = 0
+        if pieces_raw:
+            pieces_num = _parse_csv_number(pieces_raw, "Pezzi", row_number)
+            if pieces_num < 0 or not float(pieces_num).is_integer():
+                raise ValueError(f"Riga {row_number}: Pezzi deve essere un intero maggiore o uguale a zero.")
+            pieces = int(pieces_num)
+
+        rows.append({
+            "option": "",
+            "__row_id": f"dist_csv_{uuid.uuid4()}",
+            "__action_touch": 0,
+            "__deleted": 0,
+            "__item_id": item_id,
+            "__item_type": item_type,
+            "Giorno": day,
+            "Pasto": meal,
+            "Alimento": display_choice,
+            "Grammi (g)": round(grams, 2),
+            "Pezzi": pieces,
+        })
+
+    return _normalize_distribution_df(pd.DataFrame(rows))
+
+
+
+def _distribution_piece_snapshot(data, food_dict, recipe_id_by_name=None):
+    """Snapshot volatile dei pezzi, indicizzato come i meal item DB.
+
+    Non viene mai persistito: serve solo a mantenere la rappresentazione in pezzi
+    durante la sessione corrente (tabella di dettaglio/PDF).
+    """
+    df = _sync_distribution_identity(data, food_dict)
+    day_code_map = {label: code for code, label in GIORNI_MAP.items()}
+    snapshot = {}
+    for _, row in df.iterrows():
+        pieces = _pieces_value(row.get("Pezzi"))
+        if pieces <= 0:
+            continue
+        day_code = day_code_map.get(str(row.get("Giorno") or "").strip())
+        meal = str(row.get("Pasto") or "").strip()
+        item_type = str(row.get("__item_type") or "").strip().lower()
+        item_id = str(row.get("__item_id") or "").strip()
+        if item_type == "recipe" and recipe_id_by_name:
+            recipe_name = _recipe_name_from_label(row.get("Alimento"))
+            mapped_id = recipe_id_by_name.get(str(recipe_name or "").casefold())
+            if mapped_id:
+                item_id = str(mapped_id)
+        grams = _safe_float(row.get("Grammi (g)"))
+        if day_code not in GIORNI_MAP or not meal or item_type not in {"food", "recipe"} or not item_id or grams <= 0:
+            continue
+        key = "|".join([
+            str(day_code),
+            meal,
+            item_type,
+            item_id,
+            f"{grams:.2f}",
+        ])
+        snapshot.setdefault(key, []).append(pieces)
+    return snapshot
 
 
 def _resolve_distribution_day_label(value):
@@ -1580,7 +1958,7 @@ def _resolve_distribution_day_label(value):
 
 
 def _distribution_df_from_diet_items(items):
-    """Ricostruisce la Distribuzione preservando le righe recipe_id come ricette."""
+    """Ricostruisce la Distribuzione preservando ID/nome e recipe_id."""
     rows = []
     for idx, item in enumerate(items or []):
         day_label = _resolve_distribution_day_label(item.get("giorno_settimana"))
@@ -1588,15 +1966,21 @@ def _distribution_df_from_diet_items(items):
         display_choice = _diet_item_display_choice(item)
         if not day_label or not meal_label or not display_choice:
             continue
+        recipe_id = item.get("recipe_id")
+        item_id = recipe_id or item.get("food_id")
         rows.append({
             "option": "",
             "__row_id": f"dist_import_{idx}",
             "__action_touch": 0,
             "__deleted": 0,
+            "__item_id": str(item_id) if item_id else None,
+            "__item_type": "recipe" if recipe_id else "food",
             "Giorno": day_label,
             "Pasto": meal_label,
             "Alimento": display_choice,
             "Grammi (g)": _safe_float(item.get("grams")),
+            # Pezzi e solo rappresentazione UI e non viene ricostruito dal DB.
+            "Pezzi": _pieces_value(item.get("pieces") or item.get("pezzi")),
         })
 
     if not rows:
@@ -1612,10 +1996,13 @@ def _distribution_signature(data):
             "" if pd.isna(day) else str(day).strip(),
             "" if pd.isna(meal) else str(meal).strip(),
             "" if pd.isna(food) else str(food).strip(),
+            "" if item_id is None else str(item_id),
+            "" if item_type is None else str(item_type),
             round(_safe_float(grams), 4),
+            _pieces_value(pieces),
         )
-        for row_id, day, meal, food, grams in df[
-            ["__row_id", "Giorno", "Pasto", "Alimento", "Grammi (g)"]
+        for row_id, day, meal, food, item_id, item_type, grams, pieces in df[
+            ["__row_id", "Giorno", "Pasto", "Alimento", "__item_id", "__item_type", "Grammi (g)", "Pezzi"]
         ].itertuples(index=False, name=None)
     )
 
@@ -1675,10 +2062,10 @@ def _distribution_occurrences(data=None):
 
 
 def _process_distribution(data, food_dict, food_js_db, days, meals):
-    """Converte la grid in meal item persistibili preservando food_id XOR recipe_id.
+    """Converte la grid in meal item persistibili preservando la coppia ID/nome.
 
-    Le ricette NON vengono esplose in diet_meal_items: l'espansione avviene solo per
-    Budget/coerenza. I macro della riga ricetta sono calcolati dal profilo della ricetta.
+    Le ricette NON vengono esplose in diet_meal_items: l'espansione avviene solo
+    per Budget/coerenza. Pezzi e un attributo transitorio di presentazione.
     """
     df = _normalize_distribution_df(data)
     day_code_map = {label: code for code, label in GIORNI_MAP.items()}
@@ -1688,17 +2075,29 @@ def _process_distribution(data, food_dict, food_js_db, days, meals):
     weekly = _zero_totals()
     daily = {day: _zero_totals() for day in days}
 
-    for day, meal, choice, grams in df[["Giorno", "Pasto", "Alimento", "Grammi (g)"]].itertuples(index=False, name=None):
+    for day, meal, choice, item_id, item_type, grams, pieces in df[[
+        "Giorno", "Pasto", "Alimento", "__item_id", "__item_type", "Grammi (g)", "Pezzi"
+    ]].itertuples(index=False, name=None):
         day = "" if pd.isna(day) else str(day).strip()
         meal = "" if pd.isna(meal) else str(meal).strip()
         choice = "" if pd.isna(choice) else str(choice).strip()
+        item_id = "" if item_id is None else str(item_id).strip()
+        item_type = "" if item_type is None else str(item_type).strip().lower()
         grams_value = _safe_float(grams)
+        pieces_value = _pieces_value(pieces)
         if day not in allowed_days or meal not in allowed_meals or not choice or grams_value <= 0:
             continue
 
         recipe_name = _recipe_name_from_label(choice)
-        if recipe_name is None:
+        is_recipe = item_type == "recipe" or recipe_name is not None
+        if not is_recipe:
             if choice not in food_dict or choice not in food_js_db:
+                continue
+            catalog_id = str(food_dict[choice].get("id") or "")
+            if not catalog_id:
+                continue
+            # L'ID nascosto deve rappresentare la stessa entita mostrata per nome.
+            if item_id and item_id != catalog_id:
                 continue
             nutrition = food_js_db[choice]
             ratio = grams_value / 100.0
@@ -1711,20 +2110,26 @@ def _process_distribution(data, food_dict, food_js_db, days, meals):
                 "giorno_settimana": day_code_map[day],
                 "giorno_label": day,
                 "meal_type": meal,
-                "food_id": food_dict[choice]["id"],
+                "food_id": catalog_id,
                 "food_name": choice,
                 "recipe_id": None,
                 "recipe_ref": None,
                 "grams": round(grams_value, 2),
+                "pieces": pieces_value,
                 "kcal": kcal,
                 "carbs": carbs,
                 "fats": fats,
                 "prot": prot,
             }
         else:
-            recipe = _get_recipes().get(recipe_name)
+            recipe = _recipe_by_id(item_id) if item_id else None
+            if recipe is None and recipe_name is not None:
+                recipe = _get_recipes().get(recipe_name)
             profile = _recipe_profile(recipe, food_js_db) if recipe else None
             if not recipe or profile is None:
+                continue
+            effective_name = str(recipe.get("name") or recipe_name or "").strip()
+            if recipe_name and _food_name_key(effective_name) != _food_name_key(recipe_name):
                 continue
             ratio = grams_value / 100.0
             kcal = round(_safe_float(profile.get("kcal")) * ratio, 1)
@@ -1738,12 +2143,11 @@ def _process_distribution(data, food_dict, food_js_db, days, meals):
                 "meal_type": meal,
                 "food_id": None,
                 "food_name": None,
-                # Per una ricetta gia persistita l'ID puo essere usato direttamente.
-                # Per una nuova ricetta il service risolve recipe_ref dopo l'INSERT recipes.
                 "recipe_id": recipe.get("id"),
                 "recipe_ref": recipe.get("client_key"),
-                "recipe_name": recipe.get("name"),
+                "recipe_name": effective_name,
                 "grams": round(grams_value, 2),
+                "pieces": pieces_value,
                 "kcal": kcal,
                 "carbs": carbs,
                 "fats": fats,
@@ -1760,9 +2164,10 @@ def _process_distribution(data, food_dict, food_js_db, days, meals):
 
 def _recalculate_distribution(food_dict, food_js_db, days, meals, trigger="unknown"):
 
-    """Consolida SOLO la Distribuzione; non legge e non aggiorna il Budget."""
+    """Consolida SOLO la Distribuzione; sincronizza ID/nome e applica l'ordinamento canonico."""
     raw_df = st.session_state.get(DISTRIBUTION_GRID_KEY, _empty_distribution_df())
-    normalized = _normalize_distribution_df(raw_df)
+    normalized = _sync_distribution_identity(raw_df, food_dict)
+    normalized = _sort_distribution_df(normalized)
     items, weekly, daily = _process_distribution(normalized, food_dict, food_js_db, days, meals)
     st.session_state[DISTRIBUTION_GRID_KEY] = normalized
     st.session_state[DISTRIBUTION_SIG_KEY] = _distribution_signature(normalized)
@@ -1811,7 +2216,8 @@ def _merge_distribution_view(master_df, edited_view_df, visible_ids):
 
     editable_cols = [
         "option", "__row_id", "__action_touch", "__deleted",
-        "Giorno", "Pasto", "Alimento", "Grammi (g)"
+        "__item_id", "__item_type",
+        "Giorno", "Pasto", "Alimento", "Grammi (g)", "Pezzi"
     ]
     master_index = {
         str(row_id): idx
@@ -1872,10 +2278,13 @@ def _append_distribution_row(day=None, meal=None, food=None):
         "__row_id": f"dist_{uuid.uuid4()}",
         "__action_touch": 0,
         "__deleted": 0,
+        "__item_id": None,
+        "__item_type": None,
         "Giorno": day,
         "Pasto": meal,
         "Alimento": food,
         "Grammi (g)": 0.0,
+        "Pezzi": 0,
     }
     master = pd.concat([master, pd.DataFrame([row])], ignore_index=True)
     st.session_state[DISTRIBUTION_GRID_KEY] = _normalize_distribution_df(master)
@@ -3624,10 +4033,13 @@ class DistributionRowOptionsRenderer {
                 __row_id: id,
                 __action_touch: 0,
                 __deleted: 0,
+                __item_id: null,
+                __item_type: null,
                 Giorno: context.defaultDay || 'Lunedì',
                 Pasto: context.defaultMeal || 'Colazione',
                 Alimento: context.defaultFood || null,
-                'Grammi (g)': 0.0
+                'Grammi (g)': 0.0,
+                Pezzi: 0
             };
             const currentIndex = params.node && params.node.rowIndex != null
                 ? params.node.rowIndex
@@ -4094,18 +4506,30 @@ class DistributionRowOptionsRenderer {
                     f"circa **{per_portion:.1f} g per porzione**."
                 )
 
+            recipe_db_plan_id = st.session_state.get("diet_loaded_plan_id")
+            if recipe_db_plan_id is None:
+                st.info(
+                    "Le ricette vengono salvate direttamente a DB e richiedono un piano già esistente. "
+                    "Salva prima il nuovo piano, quindi riaprilo per creare le ricette."
+                )
+
             save_prep_col, delete_prep_col = st.columns(2)
             with save_prep_col:
                 save_prep_clicked = st.button(
-                    "💾 Salva ricetta",
+                    "💾 Salva ricetta a DB",
                     key=f"save_preparation_{prep_key_suffix}",
+                    disabled=recipe_db_plan_id is None,
                     use_container_width=True,
                 )
             with delete_prep_col:
                 delete_prep_clicked = st.button(
-                    "🗑️ Elimina ricetta",
+                    "🗑️ Elimina ricetta da DB",
                     key=f"delete_preparation_{prep_key_suffix}",
-                    disabled=editing_prep_name is None,
+                    disabled=(
+                        editing_prep_name is None
+                        or recipe_db_plan_id is None
+                        or not editing_prep.get("id")
+                    ),
                     use_container_width=True,
                 )
 
@@ -4122,11 +4546,12 @@ class DistributionRowOptionsRenderer {
                 ):
                     st.error(f"Esiste già una ricetta chiamata '{clean_prep_name}'.")
                 else:
-                    # Ogni ingrediente deve restare entro il proprio Budget complessivo.
                     over_budget = [
                         item["food_name"]
                         for item in prep_ingredients
-                        if _safe_float(item["grams"]) > _safe_float(budget_targets_for_prep.get(item["food_name"])) + 0.05
+                        if _safe_float(item["grams"]) > _safe_float(
+                            budget_targets_for_prep.get(item["food_name"])
+                        ) + 0.05
                     ]
                     if over_budget:
                         st.error(
@@ -4134,39 +4559,58 @@ class DistributionRowOptionsRenderer {
                             + ", ".join(over_budget)
                         )
                     else:
-                        if editing_prep_name and editing_prep_name != clean_prep_name:
-                            all_preps.pop(editing_prep_name, None)
-                            _rename_recipe_in_distribution(editing_prep_name, clean_prep_name)
-                        all_preps[clean_prep_name] = {
+                        recipe_payload = {
                             "id": editing_prep.get("id") if editing_prep_name else None,
-                            "client_key": (
-                                editing_prep.get("client_key")
-                                if editing_prep_name
-                                else str(uuid.uuid4())
-                            ),
                             "name": clean_prep_name,
                             "description": str(prep_description or "").strip(),
                             "portions": int(prep_portions),
                             "ingredients": prep_ingredients,
                         }
-                        st.session_state[RECIPES_KEY] = all_preps
-                        st.session_state["diet_preparation_flash"] = f"Ricetta '{clean_prep_name}' salvata nell'editor. Verrà persistita con il piano."
-                        st.session_state["diet_aggregations_dirty"] = True
-                        st.session_state["diet_budget_comparison_stale"] = True
-                        _rerun_after_numeric_sync()
+                        try:
+                            save_recipe_for_diet(
+                                tec_conf,
+                                recipe_db_plan_id,
+                                current_patient_id,
+                                recipe_payload,
+                            )
+                            # recipe_id resta invariato in caso di rename: aggiorniamo
+                            # soltanto la label mostrata nella Distribuzione corrente.
+                            if editing_prep_name and editing_prep_name != clean_prep_name:
+                                _rename_recipe_in_distribution(editing_prep_name, clean_prep_name)
+
+                            _set_recipes(get_recipes_for_diet(tec_conf, recipe_db_plan_id))
+                            st.session_state["diet_preparation_flash"] = (
+                                f"Ricetta '{clean_prep_name}' salvata direttamente a DB."
+                            )
+                            st.session_state["diet_aggregations_dirty"] = True
+                            st.session_state["diet_budget_comparison_stale"] = True
+                            _rerun_after_numeric_sync()
+                        except Exception as exc:
+                            logger.error("Errore nel salvataggio diretto della ricetta", exc_info=True)
+                            st.error(f"Impossibile salvare la ricetta: {exc}")
 
             if delete_prep_clicked and editing_prep_name:
                 if _recipe_is_used(editing_prep_name):
                     st.error(
-                        "La ricetta è già usata nella Distribuzione. "
+                        "La ricetta è usata nella Distribuzione corrente. "
                         "Rimuovi prima le relative allocazioni."
                     )
                 else:
-                    all_preps = _get_recipes()
-                    all_preps.pop(editing_prep_name, None)
-                    st.session_state[RECIPES_KEY] = all_preps
-                    st.session_state["diet_preparation_flash"] = f"Ricetta '{editing_prep_name}' rimossa dall'editor. La modifica verrà persistita con il piano."
-                    _rerun_after_numeric_sync()
+                    try:
+                        delete_recipe_from_diet(
+                            tec_conf,
+                            recipe_db_plan_id,
+                            current_patient_id,
+                            editing_prep.get("id"),
+                        )
+                        _set_recipes(get_recipes_for_diet(tec_conf, recipe_db_plan_id))
+                        st.session_state["diet_preparation_flash"] = (
+                            f"Ricetta '{editing_prep_name}' eliminata dal DB."
+                        )
+                        _rerun_after_numeric_sync()
+                    except Exception as exc:
+                        logger.error("Errore nell'eliminazione diretta della ricetta", exc_info=True)
+                        st.error(f"Impossibile eliminare la ricetta: {exc}")
 
         prep_flash = st.session_state.pop("diet_preparation_flash", None)
         if prep_flash:
@@ -4201,6 +4645,84 @@ class DistributionRowOptionsRenderer {
             "Tutte le allocazioni sono nella stessa tabella. Puoi usare un alimento singolo oppure una "
             "ricetta (🍳). Le ricette sono persistite tramite recipe_id e vengono esplose solo per Budget e controlli."
         )
+
+        # --------------------------------------------------------------
+        # Modalità CSV editabile: stesso master della grid, con ID + Item Name.
+        # --------------------------------------------------------------
+        csv_toggle_col, csv_help_col = st.columns([1, 4])
+        with csv_toggle_col:
+            if st.button(
+                "Mostra </>",
+                key="toggle_distribution_csv",
+                help="Mostra/nasconde il CSV editabile della Distribuzione.",
+            ):
+                new_state = not st.session_state.get(DISTRIBUTION_CSV_VISIBLE_KEY, False)
+                st.session_state[DISTRIBUTION_CSV_VISIBLE_KEY] = new_state
+                if new_state:
+                    st.session_state[DISTRIBUTION_CSV_TEXT_KEY] = _distribution_to_csv_text(
+                        st.session_state.get(DISTRIBUTION_GRID_KEY, _empty_distribution_df()),
+                        food_dict,
+                    )
+        with csv_help_col:
+            st.caption(
+                "CSV e frontend modificano lo stesso master. Nel CSV ogni item è identificato dalla coppia "
+                "Item ID + Item Name; nella grid l'ID resta nascosto e viene mostrato solo il nome."
+            )
+
+        if st.session_state.get(DISTRIBUTION_CSV_VISIBLE_KEY, False):
+            if DISTRIBUTION_CSV_TEXT_KEY not in st.session_state:
+                st.session_state[DISTRIBUTION_CSV_TEXT_KEY] = _distribution_to_csv_text(
+                    st.session_state.get(DISTRIBUTION_GRID_KEY, _empty_distribution_df()),
+                    food_dict,
+                )
+            st.text_area(
+                "CSV Distribuzione",
+                key=DISTRIBUTION_CSV_TEXT_KEY,
+                height=240,
+                help=(
+                    "Formato: Giorno;Pasto;Tipo;Item ID;Item Name;Grammi (g);Pezzi. "
+                    "Tipo = food oppure recipe. Pezzi è opzionale e non viene persistito nel DB."
+                ),
+            )
+            csv_apply_col, csv_reload_col = st.columns(2)
+            with csv_apply_col:
+                if st.button(
+                    "⬆️ Applica CSV alla Distribuzione",
+                    key="apply_distribution_csv",
+                    use_container_width=True,
+                ):
+                    try:
+                        imported_distribution = _distribution_from_csv_text(
+                            st.session_state.get(DISTRIBUTION_CSV_TEXT_KEY, ""),
+                            food_dict,
+                            day_options_list,
+                            pasti_options,
+                        )
+                        imported_distribution = _sort_distribution_df(imported_distribution)
+                        st.session_state[DISTRIBUTION_GRID_KEY] = imported_distribution
+                        st.session_state[DISTRIBUTION_SIG_KEY] = _distribution_signature(imported_distribution)
+                        st.session_state["diet_aggregations_dirty"] = True
+                        st.session_state["diet_budget_comparison_stale"] = True
+                        st.session_state[DISTRIBUTION_CSV_TEXT_KEY] = _distribution_to_csv_text(
+                            imported_distribution, food_dict
+                        )
+                        st.session_state["diet_distribution_flash_message"] = (
+                            "Distribuzione caricata dal CSV. Aggiorna i valori medi per consolidare macro e ordinamento."
+                        )
+                        _rerun_after_numeric_sync()
+                    except Exception as exc:
+                        st.error(f"CSV non applicato: {exc}")
+            with csv_reload_col:
+                if st.button(
+                    "↩️ Ricarica CSV dalla grid",
+                    key="reload_distribution_csv",
+                    use_container_width=True,
+                ):
+                    st.session_state[DISTRIBUTION_CSV_TEXT_KEY] = _distribution_to_csv_text(
+                        st.session_state.get(DISTRIBUTION_GRID_KEY, _empty_distribution_df()),
+                        food_dict,
+                    )
+                    _rerun_after_numeric_sync()
 
         distribution_flash = st.session_state.pop("diet_distribution_flash_message", None)
         if distribution_flash:
@@ -4317,7 +4839,10 @@ class DistributionRowOptionsRenderer {
             else:
                 distribution_view = filtered_distribution.copy()
                 gb = GridOptionsBuilder.from_dataframe(distribution_view)
-                for hidden_col in ("::auto_unique_id::", "__row_id", "__action_touch", "__deleted"):
+                for hidden_col in (
+                    "::auto_unique_id::", "__row_id", "__action_touch", "__deleted",
+                    "__item_id", "__item_type"
+                ):
                     gb.configure_column(hidden_col, hide=True, suppressColumnsToolPanel=True)
                 gb.configure_column(
                     "option", headerName="option", editable=False, sortable=False, filter=False,
@@ -4347,6 +4872,13 @@ class DistributionRowOptionsRenderer {
                 )
                 gb.configure_column(
                     "Grammi (g)", editable=True, type="numericColumn", minWidth=110, flex=0.9
+                )
+                gb.configure_column(
+                    "Pezzi", editable=True, type="numericColumn", minWidth=90, flex=0.7,
+                    headerTooltip=(
+                        "Solo rappresentazione: se maggiore di 0 viene mostrato il numero di pezzi; "
+                        "la persistenza e i calcoli restano sempre basati sui grammi."
+                    ),
                 )
                 gb.configure_column("Kcal", valueGetter=js_kcal, type="numericColumn", editable=False, flex=0.8)
                 gb.configure_column("Carbs", valueGetter=js_carbs, type="numericColumn", editable=False, flex=0.8)
@@ -4612,6 +5144,17 @@ class DistributionRowOptionsRenderer {
                                 new_diet_id = add_diet_plan_with_recipes(
                                     tec_conf, diet_payload, temp_processed_items, recipes_payload
                                 )
+                                new_recipes = get_recipes_for_diet(tec_conf, new_diet_id)
+                                new_recipe_ids_by_name = {
+                                    str(recipe.get("name") or "").casefold(): recipe.get("id")
+                                    for recipe in new_recipes
+                                    if recipe.get("id")
+                                }
+                                st.session_state[f"diet_piece_snapshot_{new_diet_id}"] = _distribution_piece_snapshot(
+                                    st.session_state.get(DISTRIBUTION_GRID_KEY, _empty_distribution_df()),
+                                    food_dict,
+                                    recipe_id_by_name=new_recipe_ids_by_name,
+                                )
                                 st.session_state["diet_flash_message"] = (
                                     f"Nuovo piano '{normalized_name}' salvato con successo (ID: {new_diet_id})."
                                 )
@@ -4633,6 +5176,10 @@ class DistributionRowOptionsRenderer {
                             else:
                                 update_diet_plan_with_recipes(
                                     tec_conf, loaded_id, diet_payload, temp_processed_items, recipes_payload
+                                )
+                                st.session_state[f"diet_piece_snapshot_{loaded_id}"] = _distribution_piece_snapshot(
+                                    st.session_state.get(DISTRIBUTION_GRID_KEY, _empty_distribution_df()),
+                                    food_dict,
                                 )
                                 st.session_state["diet_loaded_plan_name"] = normalized_name
                                 st.session_state["diet_flash_message"] = (

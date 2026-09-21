@@ -338,6 +338,170 @@ def get_recipes_for_diet(conf, diet_plan_id) -> list:
         disconnect(conn)
 
 
+
+def save_recipe_for_diet(conf, diet_plan_id, patient_id: str, recipe_data: dict) -> dict:
+    """Crea o aggiorna UNA ricetta direttamente a DB.
+
+    La ricetta viene salvata immediatamente in recipes / recipe_ingredients,
+    indipendentemente dal successivo salvataggio della Distribuzione del piano.
+    L'ownership del piano e verificata tramite patient_id.
+    """
+    recipe = _normalize_recipe_payload(recipe_data)
+    conn = connect(conf)
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT 1
+                FROM diet_plans
+                WHERE id = %s AND patient_id = %s
+                FOR UPDATE;
+                """,
+                (diet_plan_id, patient_id),
+            )
+            if cur.fetchone() is None:
+                raise ValueError("Piano alimentare non trovato per l'assistito selezionato.")
+
+            requested_id = recipe.get("id")
+            duplicate_params = [diet_plan_id, recipe["name"]]
+            duplicate_sql = """
+                SELECT id
+                FROM recipes
+                WHERE diet_plan_id = %s
+                  AND LOWER(TRIM(name)) = LOWER(TRIM(%s))
+            """
+            if requested_id:
+                duplicate_sql += " AND id <> %s"
+                duplicate_params.append(requested_id)
+            duplicate_sql += " LIMIT 1;"
+            cur.execute(duplicate_sql, tuple(duplicate_params))
+            if cur.fetchone() is not None:
+                raise ValueError(f"Esiste già una ricetta chiamata '{recipe['name']}' nel piano.")
+
+            if requested_id:
+                cur.execute(
+                    """
+                    UPDATE recipes
+                    SET name = %s,
+                        description = %s,
+                        portions = %s
+                    WHERE id = %s
+                      AND diet_plan_id = %s
+                    RETURNING id;
+                    """,
+                    (
+                        recipe["name"],
+                        recipe["description"],
+                        recipe["portions"],
+                        requested_id,
+                        diet_plan_id,
+                    ),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise ValueError("Ricetta non trovata nel piano selezionato.")
+                recipe_id = row["id"]
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO recipes (name, description, diet_plan_id, portions)
+                    VALUES (%s, %s, %s, %s)
+                    RETURNING id;
+                    """,
+                    (
+                        recipe["name"],
+                        recipe["description"],
+                        diet_plan_id,
+                        recipe["portions"],
+                    ),
+                )
+                recipe_id = cur.fetchone()["id"]
+
+            _replace_recipe_ingredients(cur, recipe_id, recipe["ingredients"])
+
+        conn.commit()
+        logging.info("Ricetta %s salvata direttamente sul piano %s.", recipe_id, diet_plan_id)
+        return {
+            "id": recipe_id,
+            "recipe_id": recipe_id,
+            "diet_plan_id": diet_plan_id,
+            "name": recipe["name"],
+            "description": recipe["description"],
+            "portions": recipe["portions"],
+            "ingredients": [
+                {
+                    "food_id": ingredient["food_id"],
+                    "food_name": ingredient.get("food_name"),
+                    "grams": ingredient["grams"],
+                }
+                for ingredient in recipe["ingredients"]
+            ],
+        }
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"Errore in save_recipe_for_diet: {e}")
+        raise
+    finally:
+        disconnect(conn)
+
+
+def delete_recipe_from_diet(conf, diet_plan_id, patient_id: str, recipe_id) -> None:
+    """Elimina una ricetta direttamente a DB se non e ancora referenziata dalla Distribuzione salvata."""
+    conn = connect(conf)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1
+                FROM diet_plans
+                WHERE id = %s AND patient_id = %s
+                FOR UPDATE;
+                """,
+                (diet_plan_id, patient_id),
+            )
+            if cur.fetchone() is None:
+                raise ValueError("Piano alimentare non trovato per l'assistito selezionato.")
+
+            cur.execute(
+                """
+                SELECT 1
+                FROM recipes
+                WHERE id = %s AND diet_plan_id = %s
+                FOR UPDATE;
+                """,
+                (recipe_id, diet_plan_id),
+            )
+            if cur.fetchone() is None:
+                raise ValueError("Ricetta non trovata nel piano selezionato.")
+
+            cur.execute(
+                "SELECT 1 FROM diet_meal_items WHERE recipe_id = %s LIMIT 1;",
+                (recipe_id,),
+            )
+            if cur.fetchone() is not None:
+                raise ValueError(
+                    "La ricetta è ancora utilizzata nella Distribuzione salvata. "
+                    "Rimuovi le relative allocazioni e aggiorna prima il piano alimentare."
+                )
+
+            # recipe_ingredients viene eliminata da ON DELETE CASCADE.
+            cur.execute(
+                "DELETE FROM recipes WHERE id = %s AND diet_plan_id = %s;",
+                (recipe_id, diet_plan_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("Impossibile eliminare la ricetta selezionata.")
+
+        conn.commit()
+        logging.info("Ricetta %s eliminata direttamente dal piano %s.", recipe_id, diet_plan_id)
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"Errore in delete_recipe_from_diet: {e}")
+        raise
+    finally:
+        disconnect(conn)
+
+
 def get_diet_plans(conf, patient_id: str) -> list:
     """Recupera i piani alimentari con meal item di tipo food o recipe."""
     conn = connect(conf)
