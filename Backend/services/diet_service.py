@@ -147,6 +147,10 @@ def _normalize_recipe_payload(recipe: dict) -> dict:
     if not ingredients:
         raise ValueError(f"La ricetta '{name}' deve contenere almeno un ingrediente.")
 
+    description = str(recipe.get("description") or "").strip()
+    if len(description) > 500:
+        raise ValueError(f"La descrizione della ricetta '{name}' non può superare 500 caratteri.")
+
     recipe_id = recipe.get("id") or recipe.get("recipe_id")
     client_key = recipe.get("client_key") or recipe_id
 
@@ -154,6 +158,7 @@ def _normalize_recipe_payload(recipe: dict) -> dict:
         "id": recipe_id,
         "client_key": str(client_key) if client_key is not None else None,
         "name": name,
+        "description": description or None,
         "portions": portions,
         "ingredients": ingredients,
     }
@@ -193,11 +198,11 @@ def _insert_recipes_for_new_plan(cur, diet_id, recipes_data: list):
     for recipe in recipes:
         cur.execute(
             """
-            INSERT INTO recipes (name, diet_plan_id, portions)
-            VALUES (%s, %s, %s)
+            INSERT INTO recipes (name, description, diet_plan_id, portions)
+            VALUES (%s, %s, %s, %s)
             RETURNING id;
             """,
-            (recipe["name"], diet_id, recipe["portions"]),
+            (recipe["name"], recipe["description"], diet_id, recipe["portions"]),
         )
         recipe_id = cur.fetchone()["id"]
         created_ids.add(str(recipe_id))
@@ -245,21 +250,21 @@ def _sync_recipes_for_existing_plan(cur, diet_id, recipes_data: list):
             cur.execute(
                 """
                 UPDATE recipes
-                SET name = %s, portions = %s
+                SET name = %s, description = %s, portions = %s
                 WHERE id = %s AND diet_plan_id = %s;
                 """,
-                (recipe["name"], recipe["portions"], recipe_id, diet_id),
+                (recipe["name"], recipe["description"], recipe["portions"], recipe_id, diet_id),
             )
             if cur.rowcount != 1:
                 raise ValueError(f"Impossibile aggiornare la ricetta {requested_id}.")
         else:
             cur.execute(
                 """
-                INSERT INTO recipes (name, diet_plan_id, portions)
-                VALUES (%s, %s, %s)
+                INSERT INTO recipes (name, description, diet_plan_id, portions)
+                VALUES (%s, %s, %s, %s)
                 RETURNING id;
                 """,
-                (recipe["name"], diet_id, recipe["portions"]),
+                (recipe["name"], recipe["description"], diet_id, recipe["portions"]),
             )
             recipe_id = cur.fetchone()["id"]
 
@@ -287,6 +292,7 @@ def get_recipes_for_diet(conf, diet_plan_id) -> list:
                     r.id AS recipe_id,
                     r.diet_plan_id,
                     r.name,
+                    r.description,
                     r.portions,
                     ri.id AS ingredient_id,
                     ri.food_id,
@@ -312,6 +318,7 @@ def get_recipes_for_diet(conf, diet_plan_id) -> list:
                     "recipe_id": recipe_id,
                     "diet_plan_id": row["diet_plan_id"],
                     "name": row["name"],
+                    "description": row.get("description"),
                     "portions": row["portions"],
                     "ingredients": [],
                 }

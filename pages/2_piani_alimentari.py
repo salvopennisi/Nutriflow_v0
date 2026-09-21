@@ -1305,6 +1305,7 @@ def _normalize_recipe(recipe):
         "id": str(recipe_id) if recipe_id else None,
         "client_key": str(client_key),
         "name": name,
+        "description": str(recipe.get("description") or "").strip(),
         "portions": max(1, int(recipe.get("portions") or 1)),
         "ingredients": ingredients,
     }
@@ -1487,6 +1488,7 @@ def _recipes_payload_for_persistence():
             "id": recipe.get("id"),
             "client_key": recipe.get("client_key"),
             "name": recipe.get("name"),
+            "description": str(recipe.get("description") or "").strip(),
             "portions": int(recipe.get("portions") or 1),
             "ingredients": [
                 {
@@ -4038,6 +4040,16 @@ class DistributionRowOptionsRenderer {
                     key=f"diet_preparation_portions_{prep_key_suffix}",
                 )
 
+            prep_description = st.text_area(
+                "Descrizione ricetta",
+                value=str(editing_prep.get("description") or ""),
+                placeholder="es. Pancake proteici da preparare in padella antiaderente; dividere in 5 porzioni.",
+                max_chars=500,
+                height=80,
+                key=f"diet_preparation_description_{prep_key_suffix}",
+                help="Breve descrizione o indicazione di preparazione (max 500 caratteri).",
+            )
+
             current_ingredients = {
                 str(item.get("food_name") or "").strip(): _safe_float(item.get("grams"))
                 for item in editing_prep.get("ingredients", []) or []
@@ -4133,6 +4145,7 @@ class DistributionRowOptionsRenderer {
                                 else str(uuid.uuid4())
                             ),
                             "name": clean_prep_name,
+                            "description": str(prep_description or "").strip(),
                             "portions": int(prep_portions),
                             "ingredients": prep_ingredients,
                         }
@@ -4167,6 +4180,7 @@ class DistributionRowOptionsRenderer {
                 profile = _recipe_profile(prep, food_js_db) or _zero_totals()
                 prep_summary_rows.append({
                     "Ricetta": _recipe_label(prep_name),
+                    "Descrizione": str(prep.get("description") or ""),
                     "Ingredienti": ", ".join(i["food_name"] for i in prep.get("ingredients", [])),
                     "Peso totale (g)": round(total_g, 1),
                     "Porzioni": int(prep.get("portions") or 1),
