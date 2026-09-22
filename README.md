@@ -84,7 +84,7 @@ Non è presente un API server applicativo: `Backend/main.py` è attualmente vuot
 
 | Biometria | ✅ Implementato | Misure antropometriche, 7 pliche, BF%, proporzioni classiche/auree, storico |
 
-| Piani alimentari | ✅ Implementato | Budget settimanale indipendente, distribuzione 7×5, confronto Budget/assegnato, macro, import/clone/update, lista spesa, PDF, micronutrienti |
+| Piani alimentari | ✅ Implementato | Budget settimanale indipendente, ricette persistenti, distribuzione 7×5, confronto Budget/assegnato, macro, import/clone/update, lista spesa, PDF, micronutrienti |
 
 | Workout | ✅ Implementato | CRUD piani, esercizi/blocchi, tecniche, registrazione performance e trend |
 
@@ -96,7 +96,7 @@ Non è presente un API server applicativo: `Backend/main.py` è attualmente vuot
 
 | Autenticazione/ruoli | 🚧 Non implementato | Esiste la tabella `users`, ma la UI usa un `user_id` placeholder |
 
-| Ricette | ❌ Non implementato | Non sono presenti service/UI attivi per ricette |
+| Ricette | ✅ Implementato nel modulo Piani alimentari | Creazione ricette da alimenti del Budget, ingredienti e porzioni persistenti, utilizzo in Distribuzione con espansione proporzionale degli ingredienti |
 
 ---
 
@@ -360,6 +360,75 @@ Alla pressione del pulsante il sistema:
 
 Questa azione **non ricalcola i macro della Distribuzione settimanale**.
 
+### Ricette del piano
+
+Tra Budget alimentare e Distribuzione settimanale è disponibile una sezione dedicata alle **ricette**, usata per aggregare più alimenti del Budget in una preparazione riutilizzabile.
+
+Esempi:
+
+```text
+
+Pancake
+├── Albume 500 g
+├── Farina d'avena 275 g
+└── Uova 120 g
+
+Frullato alla banana
+├── Whey
+├── Latte
+└── Banana
+
+```
+
+Per ogni ricetta il nutrizionista può:
+
+- definire un nome;
+
+- indicare il numero di porzioni;
+
+- selezionare gli ingredienti a partire dagli alimenti presenti nel Budget;
+
+- specificare i grammi complessivi di ciascun ingrediente;
+
+- visualizzare il peso totale della preparazione e il peso teorico per porzione;
+
+- utilizzare la ricetta nella Distribuzione settimanale come alternativa a un alimento singolo.
+
+Le ricette sono persistite tramite:
+
+```text
+
+recipes
+    │ 1:N
+    ▼
+recipe_ingredients
+```
+
+`recipes` mantiene l'identità della preparazione e il numero di porzioni, mentre `recipe_ingredients` mantiene gli alimenti reali e le relative grammature.
+
+La Distribuzione non sostituisce gli ingredienti con un alimento fittizio. Una riga può rappresentare:
+
+```text
+
+food_id valorizzato   + recipe_id NULL
+oppure
+food_id NULL          + recipe_id valorizzato
+```
+
+Quando una ricetta viene utilizzata nella Distribuzione, il sistema la **espande logicamente** nei relativi ingredienti in proporzione ai grammi assegnati. Questa espansione è utilizzata per:
+
+- calcolare kcal e macronutrienti;
+
+- aggiornare quantità assegnate e residui del Budget;
+
+- eseguire il controllo di coerenza prima del salvataggio;
+
+- aggregare gli alimenti reali per lista della spesa e controlli nutrizionali.
+
+Esempio: una ricetta Pancake da 895 g composta da 500 g di albume, 275 g di farina d'avena e 120 g di uova, se distribuita per 179 g, utilizza il 20% della ricetta e quindi assegna al Budget circa 100 g di albume, 55 g di farina d'avena e 24 g di uova.
+
+> La **descrizione breve della ricetta** è stata definita come evoluzione funzionale ma non è ancora persistita nel modello `recipes` corrente.
+
 ### Distribuzione settimanale
 
 Dopo aver definito il Budget, il piano viene distribuito su **7 giorni** e **5 pasti**:
@@ -386,15 +455,15 @@ Per ogni pasto l'utente può:
 
 - rimuovere righe;
 
-- cercare/selezionare un alimento tramite autocomplete AG Grid;
+- cercare/selezionare un alimento o una ricetta tramite autocomplete AG Grid;
 
 - indicare i grammi;
 
 - vedere kcal, carboidrati, grassi e proteine calcolati proporzionalmente.
 
-L'autocomplete della Distribuzione propone gli alimenti consolidati nel Budget settimanale.
+L'autocomplete della Distribuzione propone gli alimenti consolidati nel Budget settimanale e le ricette associate al piano. Le ricette sono riconoscibili come preparazioni e mantengono un proprio `recipe_id`.
 
-I macronutrienti degli alimenti sono considerati valori per **100 g** e vengono ricalcolati in funzione della quantità inserita.
+I macronutrienti degli alimenti sono considerati valori per **100 g** e vengono ricalcolati in funzione della quantità inserita. Per le ricette il calcolo avviene espandendo proporzionalmente gli ingredienti reali.
 
 La Distribuzione dispone di un proprio comando indipendente: **Aggiorna valori medi della Distribuzione settimanale**.
 
@@ -462,13 +531,15 @@ Dopo l'import l'utente può:
 
 All'apertura di un piano esistente:
 
-- le grid giorno/pasto vengono ricostruite dagli item persistiti;
+- la Distribuzione viene ricostruita dagli item persistiti, preservando la distinzione tra alimenti e ricette;
 
-- il Budget viene ricostruito aggregando le grammature salvate per alimento;
+- le ricette e i relativi ingredienti vengono recuperati dalle tabelle `recipes` e `recipe_ingredients`;
 
-- **Assegnati** viene inizializzato con le quantità già persistite;
+- il Budget viene ricostruito aggregando gli alimenti reali e, per le righe ricetta, espandendo proporzionalmente gli ingredienti;
 
-- **N. volte** viene ricostruito contando le occorrenze con grammatura maggiore di 0.
+- **Assegnati** viene inizializzato con le quantità alimentari effettivamente utilizzate, incluse quelle provenienti dalle ricette;
+
+- **N. volte** viene ricostruito contando le occorrenze delle allocazioni con grammatura maggiore di 0.
 
 Poiché il Budget non dispone ancora di una persistenza DB separata, per un piano riaperto il target iniziale del Budget coincide con la somma delle allocazioni salvate.
 
@@ -484,13 +555,15 @@ Le azioni:
 
 eseguono sempre un controllo di coerenza indipendente sui dati RAW correnti, anche se l'utente non ha premuto prima i pulsanti di aggiornamento del Budget o della Distribuzione.
 
-Per ogni alimento deve essere verificata la condizione:
+Per ogni alimento reale deve essere verificata la condizione:
 
 ```text
 
 Budget settimanale = Σ grammature realmente assegnate nei giorni/pasti
 
 ```
+
+Le righe di Distribuzione basate su ricetta vengono prima espanse nei relativi ingredienti, così il controllo continua a confrontare il Budget con alimenti reali e non con il nome logico della preparazione.
 
 Il salvataggio viene bloccato quando:
 
@@ -510,27 +583,35 @@ Solo dopo il superamento del controllo vengono consolidati Budget e Distribuzion
 
 ### Persistenza atomica
 
-Creazione e aggiornamento di un piano avvengono in transazione.
+Creazione e aggiornamento di un piano, delle relative ricette e della Distribuzione avvengono in transazione.
 
-In aggiornamento il dettaglio viene sostituito completamente:
+Per una nuova dieta il flusso logico è:
 
 ```text
 
-UPDATE diet_plans
-
-DELETE old diet_meal_items
-
-INSERT new diet_meal_items
-
+INSERT diet_plans
+    ↓
+INSERT recipes
+    ↓
+INSERT recipe_ingredients
+    ↓
+INSERT diet_meal_items
+    ↓
 COMMIT
 
 ```
+
+Le righe di `diet_meal_items` rispettano la regola **Food XOR Recipe**: è valorizzato uno solo tra `food_id` e `recipe_id`.
+
+In aggiornamento il backend mantiene gli UUID delle ricette già esistenti quando possibile, crea le nuove ricette, aggiorna i relativi ingredienti e riallinea il dettaglio della Distribuzione nella stessa transazione.
+
+Quando un piano esistente viene salvato come nuovo, le ricette vengono clonate con nuovi UUID e associate al nuovo `diet_plan_id`, evitando riferimenti alle ricette del piano origine.
 
 In caso di errore viene effettuato il rollback dell'intera operazione.
 
 ### Lista della spesa
 
-La lista della spesa aggrega le quantità dello stesso alimento sull'intera settimana e produce una tabella del tipo:
+La lista della spesa aggrega le quantità dello stesso alimento reale sull'intera settimana. Le ricette vengono espanse nei relativi ingredienti prima dell'aggregazione e producono quindi una tabella del tipo:
 
 | Alimento | Quantità totale (g) |
 
@@ -558,7 +639,7 @@ Il PDF viene generato in memoria con **ReportLab** e contiene:
 
 5. lista della spesa settimanale;
 
-6. una pagina di dettaglio per ogni giorno con pasti, alimenti, grammi e macro;
+6. una pagina di dettaglio per ogni giorno con pasti, alimenti/ricette, grammi e macro;
 
 7. numerazione pagina e footer.
 
@@ -1186,6 +1267,116 @@ Criteri principali:
 
 - le modifiche successive devono rispettare i cicli separati di aggiornamento Budget e Distribuzione.
 
+### US-DIET-25 - Creazione ricetta dal Budget `[UI/BE]`
+
+**Come nutrizionista, voglio aggregare più alimenti del Budget settimanale in una ricetta, così da poter prescrivere preparazioni reali senza perdere il controllo sui singoli ingredienti.**
+
+Criteri principali:
+
+- la ricetta deve essere associata al piano alimentare corrente;
+
+- il nome della ricetta deve essere definibile dal nutrizionista;
+
+- gli ingredienti devono riferirsi ad alimenti reali del catalogo e, nell'editor, essere selezionabili a partire dal Budget;
+
+- per ogni ingrediente deve essere indicata la quantità complessiva in grammi;
+
+- la ricetta deve essere persistita tramite `recipes` e `recipe_ingredients`.
+
+### US-DIET-26 - Gestione porzioni della ricetta `[UI/BE]`
+
+**Come nutrizionista, voglio definire il numero di porzioni di una ricetta, così da conoscere la quantità teorica di preparazione associata a una singola porzione.**
+
+Criteri principali:
+
+- `recipes.portions` deve essere maggiore di zero;
+
+- il sistema deve calcolare il peso totale come somma dei grammi degli ingredienti;
+
+- il peso teorico per porzione deve essere derivato come `peso totale ricetta / numero porzioni`;
+
+- la modifica delle porzioni non deve alterare automaticamente le grammature originali degli ingredienti.
+
+### US-DIET-27 - Utilizzo di una ricetta nella Distribuzione `[UI]`
+
+**Come nutrizionista, voglio selezionare una ricetta nella Distribuzione settimanale allo stesso modo di un alimento, così da assegnare una preparazione a uno specifico giorno e pasto.**
+
+Criteri principali:
+
+- l'autocomplete della Distribuzione deve proporre sia alimenti sia ricette del piano;
+
+- una riga della Distribuzione deve rappresentare alternativamente un alimento o una ricetta;
+
+- per una riga alimento deve essere valorizzato `food_id` e non `recipe_id`;
+
+- per una riga ricetta deve essere valorizzato `recipe_id` e non `food_id`;
+
+- la grammatura assegnata alla ricetta deve rappresentare la quantità effettivamente prevista in quel giorno/pasto.
+
+### US-DIET-28 - Espansione proporzionale della ricetta `[UI/BE]`
+
+**Come sistema, voglio espandere una ricetta nei relativi ingredienti in proporzione alla quantità distribuita, così da mantenere corretti Budget, macro, micronutrienti e lista della spesa.**
+
+Criteri principali:
+
+- deve essere calcolato il rapporto `grammi distribuiti / peso totale ricetta`;
+
+- ogni ingrediente deve contribuire con `grammi ingrediente × rapporto`;
+
+- le quantità espanse devono alimentare il confronto Budget/Assegnati/Residui;
+
+- i calcoli nutrizionali devono continuare a utilizzare i dati dei singoli alimenti del catalogo;
+
+- la ricetta deve restare una singola entità logica nella Distribuzione e non deve essere trasformata definitivamente in righe alimento.
+
+### US-DIET-29 - Persistenza e riapertura delle ricette `[UI/BE]`
+
+**Come nutrizionista, voglio che le ricette rimangano associate al piano dopo il salvataggio e la riapertura, così da poter continuare a modificarle e utilizzarle senza ricostruirle manualmente.**
+
+Criteri principali:
+
+- `recipes` deve essere collegata a `diet_plans`;
+
+- `recipe_ingredients` deve mantenere gli ingredienti della ricetta tramite `food_id`;
+
+- `diet_meal_items` deve poter referenziare `recipe_id`;
+
+- riaprendo un piano, la UI deve ricostruire le ricette e le relative allocazioni nella Distribuzione;
+
+- una ricetta utilizzata nella Distribuzione deve appartenere allo stesso piano alimentare.
+
+### US-DIET-30 - Aggiornamento e clonazione delle ricette `[UI/BE]`
+
+**Come nutrizionista, voglio che aggiornamento e clonazione del piano gestiscano anche le ricette, così da mantenere consistenti preparazioni e Distribuzione in tutte le operazioni sul piano.**
+
+Criteri principali:
+
+- in aggiornamento le ricette esistenti devono mantenere il proprio UUID quando restano nel piano;
+
+- le nuove ricette devono ricevere un nuovo UUID;
+
+- gli ingredienti devono essere riallineati atomicamente insieme al piano;
+
+- le ricette rimosse non devono lasciare riferimenti orfani nella Distribuzione;
+
+- quando il piano viene salvato come nuovo, le ricette devono essere clonate con nuovi UUID e collegate al nuovo `diet_plan_id`.
+
+### US-DIET-31 - Descrizione breve della ricetta `[BACKLOG]`
+
+**Come nutrizionista, voglio aggiungere una breve descrizione testuale alla ricetta, così da indicare modalità di preparazione, caratteristiche o indicazioni utili senza appesantire il piano.**
+
+Criteri principali:
+
+- la descrizione deve essere opzionale;
+
+- deve essere modificabile insieme al nome e alle porzioni;
+
+- deve essere persistita nella testata della ricetta;
+
+- deve essere recuperata alla riapertura del piano;
+
+- la sua introduzione richiede l'estensione del modello `recipes`, che attualmente non contiene una colonna dedicata.
+
 ---
 
 ## Epic D - Workout
@@ -1478,7 +1669,11 @@ Nutriflow/
 
 | `diet_plans` | Testata del piano alimentare associato all'assistito |
 
-| `diet_meal_items` | Dettaglio del piano: giorno, pasto, alimento, grammi e macro calcolati |
+| `diet_meal_items` | Dettaglio della Distribuzione: giorno, pasto, grammi e riferimento alternativo a `food_id` oppure `recipe_id`, con cache dei macro calcolati |
+
+| `recipes` | Testata delle ricette associate a uno specifico piano alimentare; contiene nome e numero di porzioni |
+
+| `recipe_ingredients` | Ingredienti della ricetta con riferimento a `foods` e quantità complessiva in grammi |
 
 | `micronutrients_quantities` | Riferimenti usati per l'overview dei micronutrienti |
 
@@ -1502,7 +1697,15 @@ users
 
  │     ├──< diet_plans
 
- │     │       └──< diet_meal_items >── foods
+ │     │     ├──< recipes
+
+ │     │     │       └──< recipe_ingredients >── foods
+
+ │     │     └──< diet_meal_items
+
+ │     │             ├──> foods
+
+ │     │             └──> recipes
 
  │     └──< workout_plans
 
@@ -1522,7 +1725,7 @@ micronutrients_quantities
 
 ```
 
-`diet_meal_items` mantiene anche una cache dei macro calcolati al momento del salvataggio del piano (`kcal_calculated`, `prot_calculated`, `carbs_calculated`, `fats_calculated`).
+`diet_meal_items` mantiene anche una cache dei macro calcolati al momento del salvataggio del piano (`kcal_calculated`, `prot_calculated`, `carbs_calculated`, `fats_calculated`). Ogni riga rappresenta **o un alimento o una ricetta**: `food_id` e `recipe_id` sono quindi mutuamente esclusivi. Le ricette restano entità persistenti, mentre i relativi ingredienti vengono espansi applicativamente per i calcoli sul Budget e sui nutrienti.
 
 ---
 
@@ -1539,6 +1742,20 @@ ratio = grammi / 100
 nutriente_calcolato = nutriente_per_100g × ratio
 
 ```
+
+## Espansione delle ricette
+
+Per una ricetta con peso totale `P` e una quantità `Q` assegnata nella Distribuzione:
+
+```text
+
+quota_ricetta = Q / P
+
+grammi_ingrediente_assegnati = grammi_ingrediente_ricetta × quota_ricetta
+
+```
+
+La quantità espansa di ogni ingrediente viene quindi trattata come normale alimento per macro, micronutrienti, confronto con il Budget e lista della spesa.
 
 ## Micronutrienti
 
@@ -1736,7 +1953,7 @@ PYTHONPATH=. pytest Backend/Test -v
 
 ```
 
-La copertura non include ancora `diet_service`, `food_service`, `workout_service` e i flussi UI Streamlit/AG Grid.
+La copertura non include ancora `diet_service`, inclusi i flussi ricette, `food_service`, `workout_service` e i flussi UI Streamlit/AG Grid.
 
 ---
 
@@ -1894,17 +2111,13 @@ come `user_id`.
 
 Poiché `patients.user_id` è una foreign key verso `users.id`, sul DB deve esistere tale utente oppure deve essere implementata una vera inizializzazione/autenticazione dell'utente.
 
-## 11. Ricette non presenti nell'implementazione corrente
+## 11. Descrizione breve delle ricette non ancora persistita
 
-Il vecchio README descriveva ricette e tabelle `recipes` / `recipe_ingredients`, ma nel codice corrente:
+La capability ricette è stata introdotta nel modulo Piani alimentari tramite `recipes`, `recipe_ingredients` e `recipe_id` in `diet_meal_items`.
 
-- non esiste un `recipe_service`;
+Resta però da completare l'evoluzione richiesta per la **descrizione breve della ricetta**: il modello `recipes` corrente contiene `id`, `name`, `diet_plan_id` e `portions`, ma non ancora una colonna dedicata alla descrizione.
 
-- non esiste una pagina ricette;
-
-- il DDL effettua solo il `DROP` delle vecchie tabelle, senza ricrearle.
-
-La capability non va quindi considerata implementata.
+Per completare la US-DIET-31 sarà necessario estendere DDL, backend e UI con un campo testuale opzionale.
 
 ---
 
@@ -1956,7 +2169,7 @@ Le priorità tecniche più immediate sono:
 
 5. aggiornare devcontainer e script di bootstrap;
 
-6. aggiungere test per `diet_service`, micronutrienti e `workout_service`;
+6. aggiungere test per `diet_service`, inclusi CRUD/persistenza ricette, micronutrienti e `workout_service`;
 
 7. estendere, se necessario, la UI del catalogo alla manutenzione delle categorie e dei riferimenti micronutrienti;
 
@@ -1965,6 +2178,8 @@ Le priorità tecniche più immediate sono:
 9. collegare alla UI il questionario di anamnesi strutturato già supportato dal backend.
 
 10. valutare una persistenza DB dedicata del Budget settimanale quando sarà necessario conservare target non ancora completamente allocati dopo la chiusura della sessione.
+
+11. aggiungere alla tabella `recipes` una descrizione breve opzionale e propagare il campo in backend e UI.
 
 ---
 
@@ -1988,4 +2203,4 @@ Le priorità tecniche più immediate sono:
 
 ---
 
-**Nutriflow** copre attualmente quattro aree operative principali: **gestione assistito, biometria, pianificazione alimentare e workout**. Il modulo Workout aggiunge prescrizione strutturata, blocchi e tecniche di allenamento, tracking per serie/segmento e analisi della progressione; la prossima evoluzione prevista è correlare ogni rilevazione biometrica alla dieta seguita e, opzionalmente, al workout svolto.
+**Nutriflow** copre attualmente quattro aree operative principali: **gestione assistito, biometria, pianificazione alimentare e workout**. Il modulo Piani alimentari comprende ora Budget settimanale, ricette persistenti con ingredienti e porzioni, Distribuzione alimenti/ricette e controlli di coerenza; il modulo Workout aggiunge prescrizione strutturata, blocchi e tecniche di allenamento, tracking per serie/segmento e analisi della progressione. Tra le evoluzioni aperte restano la descrizione breve delle ricette e la correlazione delle rilevazioni biometriche con dieta e workout.
